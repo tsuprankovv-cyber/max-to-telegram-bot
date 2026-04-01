@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: max-to-telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: MAX_TOKEN
+        sync: false
+      - key: MAX_WEBHOOK_SECRET
+        sync: false
+      - key: MAX_CHANNEL_ID
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: 1
