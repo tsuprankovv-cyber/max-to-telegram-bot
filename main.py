@@ -6,7 +6,7 @@ import logging
 import aiohttp
 import json
 from aiohttp import web
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Union
 
 # ===================================================================
 # 1. ЛОГИРОВАНИЕ
@@ -56,7 +56,38 @@ if missing:
 logger.info("✅ Переменные окружения проверены")
 
 # ===================================================================
-# 3. TELEGRAM SENDER
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ПОЛЕЙ)
+# ===================================================================
+def safe_str(value: Any) -> str:
+    """Безопасное преобразование в строку (даже если значение - dict)"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        # Пробуем извлечь строковое значение из словаря
+        for key in ['id', 'value', 'text', 'content', '_id', '$oid']:
+            if key in value:
+                return safe_str(value[key])
+        return str(value)
+    return str(value).strip()
+
+def safe_list(value: Any) -> List[Dict]:
+    """Безопасное преобразование в список словарей"""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, dict)]
+    if isinstance(value, dict):
+        # Пробуем найти список внутри словаря
+        for key in ['messages', 'items', 'data', 'result', 'message']:
+            if key in value:
+                return safe_list(value[key])
+        return [value]  # Возвращаем как список из одного элемента
+    return []
+
+# ===================================================================
+# 4. TELEGRAM SENDER
 # ===================================================================
 class TelegramSender:
     def __init__(self, token: str, chat_id: str):
@@ -105,7 +136,7 @@ class TelegramSender:
         return await self._post(f"send{media_type.capitalize()}", data=data)
 
 # ===================================================================
-# 4. MAX FETCHER (POLLING)
+# 5. MAX FETCHER (POLLING)
 # ===================================================================
 class MaxFetcher:
     def __init__(self, token: str, channel_id: str, base: str):
@@ -123,22 +154,17 @@ class MaxFetcher:
         url = f"{self.base}/messages"
         headers = {"Authorization": self.token}
         params = {"chat_id": self.channel_id, "limit": limit}
+        
         try:
             async with self.session.get(url, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     raw = await resp.json()
-                    messages = []
-                    if isinstance(raw, list): messages = raw
-                    elif isinstance(raw, dict):
-                        for key in ['messages', 'items', 'data', 'result', 'message']:
-                            if key in raw:
-                                val = raw[key]
-                                if isinstance(val, list): messages = val; break
-                                elif isinstance(val, dict): messages = [val]; break
-                    return messages
+                    logger.debug(f"📦 RAW MAX: {json.dumps(raw, ensure_ascii=False)[:500]}")
+                    return safe_list(raw)
+                logger.error(f"❌ MAX API Error: {resp.status}")
                 return []
         except Exception as e:
-            logger.error(f"❌ MAX Error: {e}")
+            logger.error(f"❌ MAX Request Error: {e}")
             return []
 
     async def download_file(self, file_token: str) -> Optional[bytes]:
@@ -155,7 +181,7 @@ class MaxFetcher:
             return None
 
 # ===================================================================
-# 5. ОБРАБОТКА СООБЩЕНИЙ
+# 6. ОБРАБОТКА СООБЩЕНИЙ
 # ===================================================================
 tg = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 max_api = MaxFetcher(MAX_TOKEN, MAX_CHANNEL_ID, MAX_API_BASE)
@@ -163,28 +189,30 @@ max_api = MaxFetcher(MAX_TOKEN, MAX_CHANNEL_ID, MAX_API_BASE)
 async def process_message(msg: Dict):
     global LAST_MSG_ID
     
-    # Извлекаем ID (пробуем разные имена полей)
-    msg_id = str(
-        msg.get("id") or msg.get("message_id") or msg.get("_id") or 
-        msg.get("msgId") or msg.get("uid") or msg.get("messageId") or ""
-    ).strip()
+    logger.debug(f"🔍 RAW msg: {json.dumps(msg, ensure_ascii=False)[:500]}")
     
-    # Извлекаем текст
-    text = (
+    # 🔹 БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ID (работает даже если ID - это dict)
+    msg_id = safe_str(
+        msg.get("id") or msg.get("message_id") or msg.get("_id") or 
+        msg.get("msgId") or msg.get("uid") or msg.get("messageId")
+    )
+    
+    # 🔹 БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ТЕКСТА
+    text = safe_str(
         msg.get("text") or msg.get("content") or msg.get("body") or 
         msg.get("message") or 
-        (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None) or ""
-    ).strip()
+        (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None)
+    )
     
-    # Извлекаем вложения
-    attachments = (
+    # 🔹 БЕЗОПАСНОЕ ИЗВЛЕЧЕНИЕ ВЛОЖЕНИЙ
+    attachments = safe_list(
         msg.get("attachments") or msg.get("files") or msg.get("media") or 
-        (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else []) or []
+        (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else None)
     )
     
     logger.info(f"🆕 Сообщение | ID:'{msg_id}' | Текст:{len(text)}симв | Файлов:{len(attachments)}")
     
-    # 🛑 ГЛАВНОЕ: Пропускаем сообщения с пустым ID (защита от бесконечного цикла)
+    # 🛑 Пропускаем сообщения с пустым ID
     if not msg_id:
         logger.debug("⏭ Пропуск: пустой ID")
         return
@@ -201,10 +229,11 @@ async def process_message(msg: Dict):
     # Отправка вложений
     for att in attachments:
         if not isinstance(att, dict): continue
-        att_type = str(att.get("type") or att.get("media_type") or "file").lower()
-        token = att.get("token") or att.get("file_token") or att.get("id")
-        filename = att.get("name") or att.get("filename") or att.get("file_name") or "file.dat"
+        att_type = safe_str(att.get("type") or att.get("media_type") or "file").lower()
+        token = safe_str(att.get("token") or att.get("file_token") or att.get("id"))
+        filename = safe_str(att.get("name") or att.get("filename") or att.get("file_name") or "file.dat")
         if not token: continue
+        
         logger.info(f"📥 Скачиваю: {filename}")
         file_data = await max_api.download_file(token)
         if not file_data: continue
@@ -226,16 +255,21 @@ async def process_message(msg: Dict):
     logger.info(f"✅ Сообщение {msg_id} обработано")
 
 # ===================================================================
-# 6. POLLING LOOP
+# 7. POLLING LOOP
 # ===================================================================
 async def polling_loop():
     global LAST_MSG_ID
     logger.info("🔄 Запуск цикла опроса...")
+    
+    # Синхронизация при старте
     init_msgs = await max_api.get_latest_messages(limit=1)
     if init_msgs:
         first = init_msgs[0]
-        LAST_MSG_ID = str(first.get("id") or first.get("message_id") or first.get("_id") or "").strip()
-        logger.info(f"📍 Стартовый ID: {LAST_MSG_ID}")
+        LAST_MSG_ID = safe_str(
+            first.get("id") or first.get("message_id") or first.get("_id")
+        )
+        logger.info(f"📍 Стартовый ID: '{LAST_MSG_ID}'")
+    
     while True:
         try:
             messages = await max_api.get_latest_messages(limit=1)
@@ -246,7 +280,7 @@ async def polling_loop():
         await asyncio.sleep(POLL_INTERVAL)
 
 # ===================================================================
-# 7. WEB SERVER (HEALTH CHECK)
+# 8. WEB SERVER (HEALTH CHECK)
 # ===================================================================
 async def health_handler(request):
     return web.json_response({"status": "ok", "service": "max-to-telegram", "last_id": LAST_MSG_ID})
@@ -255,7 +289,7 @@ app = web.Application()
 app.router.add_get('/health', health_handler)
 
 # ===================================================================
-# 8. ЗАПУСК
+# 9. ЗАПУСК
 # ===================================================================
 async def main():
     runner = web.AppRunner(app)
