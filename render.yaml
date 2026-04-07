@@ -11,9 +11,9 @@ services:
         sync: false
       - key: MAX_TOKEN
         sync: false
-      - key: MAX_WEBHOOK_SECRET
-        sync: false
       - key: MAX_CHANNEL_ID
+        sync: false
+      - key: MAX_WEBHOOK_SECRET
         sync: false
       - key: PYTHONUNBUFFERED
         value: 1
