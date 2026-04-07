@@ -13,7 +13,9 @@ services:
         sync: false
       - key: MAX_CHANNEL_ID
         sync: false
-      - key: MAX_WEBHOOK_SECRET
-        sync: false
+      - key: MAX_API_BASE_URL
+        value: "https://platform-api.max.ru"
+      - key: POLL_INTERVAL
+        value: "3"
       - key: PYTHONUNBUFFERED
-        value: 1
+        value: "1"
