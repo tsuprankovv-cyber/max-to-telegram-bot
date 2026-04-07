@@ -16,6 +16,6 @@ services:
       - key: MAX_API_BASE
         value: "https://platform-api.max.ru"
       - key: POLL_INTERVAL
-        value: "1"   # ← 1 СЕКУНДА КАК ВЫ ПРОСИЛИ
+        value: "1"
       - key: PYTHONUNBUFFERED
         value: "1"
