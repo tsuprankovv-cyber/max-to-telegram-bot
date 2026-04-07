@@ -6,7 +6,7 @@ import logging
 import aiohttp
 import json
 from aiohttp import web
-from typing import List, Dict, Optional, Any
+from typing import Optional
 
 # ===================================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -27,12 +27,9 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
-MAX_WEBHOOK_SECRET = os.getenv('MAX_WEBHOOK_SECRET', '').strip()
 MAX_CHANNEL_ID = os.getenv('MAX_CHANNEL_ID', '').strip()
+MAX_WEBHOOK_SECRET = os.getenv('MAX_WEBHOOK_SECRET', '').strip()
 BASE_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://max-to-telegram-bot.onrender.com')
-
-# Лимиты Telegram Bot API (50 МБ)
-MAX_FILE_SIZE = 50 * 1024 * 1024
 
 logger.info("=" * 80)
 logger.info("🚀 ЗАПУСК БОТА-ПЕРЕСЫЛЬЩИКА (MAX -> TELEGRAM)")
@@ -43,21 +40,28 @@ logger.info("=" * 80)
 
 # 🔹 ПРОВЕРКА ПЕРЕМЕННЫХ
 missing = []
-if not TELEGRAM_BOT_TOKEN: missing.append('TELEGRAM_BOT_TOKEN')
-if not TELEGRAM_CHAT_ID: missing.append('TELEGRAM_CHAT_ID')
-if not MAX_WEBHOOK_SECRET: missing.append('MAX_WEBHOOK_SECRET')
-if not MAX_CHANNEL_ID: missing.append('MAX_CHANNEL_ID')
+if not TELEGRAM_BOT_TOKEN:
+    missing.append('TELEGRAM_BOT_TOKEN')
+if not TELEGRAM_CHAT_ID:
+    missing.append('TELEGRAM_CHAT_ID')
+if not MAX_TOKEN:
+    missing.append('MAX_TOKEN')
+if not MAX_CHANNEL_ID:
+    missing.append('MAX_CHANNEL_ID')
+if not MAX_WEBHOOK_SECRET:
+    missing.append('MAX_WEBHOOK_SECRET')
 
 if missing:
     logger.error("❌ ОТСУТСТВУЮТ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:")
-    for var in missing: logger.error(f"   - {var}")
+    for var in missing:
+        logger.error(f"   - {var}")
     raise ValueError(f"Missing: {', '.join(missing)}")
 
 logger.info("✅ Все переменные установлены")
 logger.info("=" * 80)
 
 # ===================================================================
-# СЕССИИ
+# СЕССИЯ AIOHTTP
 # ===================================================================
 session: Optional[aiohttp.ClientSession] = None
 
@@ -78,15 +82,18 @@ class TelegramClient:
     async def send_message(self, chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
         try:
             sess = await get_session()
-            # Экранирование < > для HTML режима если нужно
-            # Но предполагаем что Max присылает уже готовый HTML
-            data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+            data = {
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": parse_mode
+            }
             async with sess.post(f"{self.api_url}/sendMessage", json=data) as resp:
                 if resp.status == 200:
                     logger.info("✅ Сообщение отправлено в Telegram")
                     return True
                 else:
-                    logger.error(f"❌ Telegram API error: {resp.status}")
+                    error = await resp.text()
+                    logger.error(f"❌ Telegram API error: {resp.status} - {error[:500]}")
                     return False
         except Exception as e:
             logger.error(f"❌ send_message exception: {e}")
@@ -94,8 +101,9 @@ class TelegramClient:
 
     async def send_photo(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
         try:
-            if len(file_bytes) > MAX_FILE_SIZE:
-                return False # Тихий пропуск
+            if len(file_bytes) > 50 * 1024 * 1024:
+                logger.warning(f"⚠️ Фото пропущено (>50MB): {len(file_bytes)} bytes")
+                return False
             
             sess = await get_session()
             data = aiohttp.FormData()
@@ -113,9 +121,9 @@ class TelegramClient:
 
     async def send_video(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
         try:
-            if len(file_bytes) > MAX_FILE_SIZE:
-                logger.warning(f"⚠️ Видео пропущено ( >50MB ): {len(file_bytes)} bytes")
-                return False # Тихий пропуск
+            if len(file_bytes) > 50 * 1024 * 1024:
+                logger.warning(f"⚠️ Видео пропущено (>50MB): {len(file_bytes)} bytes")
+                return False
             
             sess = await get_session()
             data = aiohttp.FormData()
@@ -133,9 +141,9 @@ class TelegramClient:
 
     async def send_document(self, chat_id: str, file_bytes: bytes, filename: str, caption: str = "") -> bool:
         try:
-            if len(file_bytes) > MAX_FILE_SIZE:
-                logger.warning(f"⚠️ Файл пропущен ( >50MB ): {len(file_bytes)} bytes")
-                return False # Тихий пропуск
+            if len(file_bytes) > 50 * 1024 * 1024:
+                logger.warning(f"⚠️ Файл пропущен (>50MB): {len(file_bytes)} bytes")
+                return False
 
             sess = await get_session()
             data = aiohttp.FormData()
@@ -153,7 +161,7 @@ class TelegramClient:
             
     async def send_audio(self, chat_id: str, file_bytes: bytes, filename: str, caption: str = "") -> bool:
         try:
-            if len(file_bytes) > MAX_FILE_SIZE:
+            if len(file_bytes) > 50 * 1024 * 1024:
                 return False
             
             sess = await get_session()
@@ -171,7 +179,7 @@ class TelegramClient:
             return False
 
 # ===================================================================
-# MAX API CLIENT (Для скачивания файлов по токену)
+# MAX API CLIENT
 # ===================================================================
 class MaxClient:
     def __init__(self, token: str):
@@ -181,7 +189,6 @@ class MaxClient:
     async def download_file(self, file_token: str) -> Optional[bytes]:
         try:
             sess = await get_session()
-            # Предполагаемый эндпоинт, может потребоваться корректировка после получения docs от Max
             async with sess.get(
                 f"{self.base_url}/files/{file_token}/download",
                 headers={"Authorization": self.token}
@@ -197,27 +204,16 @@ class MaxClient:
 # ОБРАБОТЧИК
 # ===================================================================
 tg_client = TelegramClient(TELEGRAM_BOT_TOKEN)
-max_client = MaxClient(MAX_TOKEN) if MAX_TOKEN else None
+max_client = MaxClient(MAX_TOKEN)
 
-async def process_max_data(data: Dict) -> bool:
-    """
-    Ожидаемая структура от Max:
-    {
-        "channel_id": "-72890925476042",
-        "text": "Сообщение",
-        "format": "html",
-        "attachments": [
-            {"type": "image", "url": "http://..."}, 
-            {"type": "video", "token": "file_token"},
-            {"type": "file", "token": "file_token", "name": "doc.pdf"}
-        ]
-    }
-    """
+async def process_max_data(data: dict) -> bool:
     try:
         text = data.get("text", "")
         attachments = data.get("attachments", [])
         msg_format = data.get("format", "HTML")
         
+        logger.info(f"📨 Получено сообщение от Max: {len(text)} символов, {len(attachments)} вложений")
+
         # 1. Отправка текста
         if text:
             await tg_client.send_message(TELEGRAM_CHAT_ID, text, parse_mode=msg_format)
@@ -229,12 +225,11 @@ async def process_max_data(data: Dict) -> bool:
             file_bytes = None
             filename = "file"
 
-            # Скачивание файла (если есть токен) или использование URL
-            if "token" in att and max_client:
+            # Скачивание файла
+            if "token" in att:
                 file_bytes = await max_client.download_file(att["token"])
                 filename = att.get("name", "file")
             elif "url" in att:
-                # Если Max присылает прямую ссылку
                 sess = await get_session()
                 async with sess.get(att["url"]) as resp:
                     if resp.status == 200:
@@ -242,9 +237,10 @@ async def process_max_data(data: Dict) -> bool:
                         filename = att.get("name", att["url"].split("/")[-1])
             
             if not file_bytes:
+                logger.warning("⚠️ Не удалось скачать файл")
                 continue
 
-            # Отправка в Telegram в зависимости от типа
+            # Отправка в Telegram
             if att_type == "image":
                 await tg_client.send_photo(TELEGRAM_CHAT_ID, file_bytes, caption)
             elif att_type == "video":
@@ -254,10 +250,9 @@ async def process_max_data(data: Dict) -> bool:
             elif att_type == "file":
                 await tg_client.send_document(TELEGRAM_CHAT_ID, file_bytes, filename, caption)
             else:
-                # По умолчанию как документ
                 await tg_client.send_document(TELEGRAM_CHAT_ID, file_bytes, filename, caption)
             
-            await asyncio.sleep(0.5) # Пауза чтобы не получить лимит
+            await asyncio.sleep(0.5)
 
         return True
     except Exception as e:
@@ -296,6 +291,7 @@ async def health_handler(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "max-to-telegram-bot"})
 
 async def cleanup(app):
+    logger.info("🧹 Закрытие сессий...")
     if session and not session.closed:
         await session.close()
 
@@ -306,6 +302,9 @@ def create_app():
     app.on_shutdown.append(cleanup)
     return app
 
+# ===================================================================
+# ЗАПУСК
+# ===================================================================
 if __name__ == '__main__':
     try:
         logger.info("🚀 Запуск сервера на порту 8080...")
