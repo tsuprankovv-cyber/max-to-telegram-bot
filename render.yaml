@@ -13,7 +13,7 @@ services:
         sync: false
       - key: MAX_CHANNEL_ID
         sync: false
-      - key: MAX_API_BASE_URL
+      - key: MAX_API_BASE
         value: "https://platform-api.max.ru"
       - key: POLL_INTERVAL
         value: "3"
