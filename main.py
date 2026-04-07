@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-import os, sys, asyncio, logging, aiohttp, json, hashlib
+import os, sys, asyncio, logging, aiohttp, json, hashlib, mimetypes
 from aiohttp import web
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Union
 
 # ===================================================================
-# 1. ЛОГИРОВАНИЕ (МАКСИМУМ ИНФОРМАЦИИ)
+# 1. ЛОГИРОВАНИЕ (МАКСИМУМ ДЕТАЛЕЙ)
 # ===================================================================
 logging.basicConfig(
     level=logging.DEBUG,
@@ -17,35 +17,35 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# 2. ПЕРЕМЕННЫЕ
+# 2. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ===================================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TG_CHAT  = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHAN  = os.getenv('MAX_CHANNEL_ID', '').strip()
 MAX_BASE  = os.getenv('MAX_API_BASE', 'https://platform-api.max.ru')
-POLL_SEC  = int(os.getenv('POLL_INTERVAL', '1'))  # ← 1 СЕКУНДА КАК ВЫ ПРОСИЛИ
+POLL_SEC  = int(os.getenv('POLL_INTERVAL', '1'))  # ← 1 СЕКУНДА
 
-_processed = set()
+_processed = set()  # Кэш хэшей для защиты от дублей
 
-logger.info("=" * 80)
-logger.info("🚀 MAX → TG FORWARDER [STABLE HASH FIX + MAX LOGS]")
+logger.info("=" * 90)
+logger.info("🚀 MAX → TG FORWARDER [ULTIMATE EDITION]")
 logger.info(f"📡 Channel: {MAX_CHAN} | 📥 Chat: {TG_CHAT}")
-logger.info(f"🔗 API: {MAX_BASE} | ⏱️ Interval: {POLL_SEC}s")
-logger.info("🔒 HASH-FIX: Using only 'mid' for deduplication")
-logger.info("=" * 80)
+logger.info(f"🔗 API: {MAX_BASE} | ⏱️ Poll: {POLL_SEC}s")
+logger.info("🔒 Hash: mid-only | 📎 Media: ALL types | 🧩 Albums: supported")
+logger.info("=" * 90)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
-    logger.critical("❌ Missing environment variables!")
+    logger.critical("❌ MISSING ENV VARS! Check Render settings.")
     sys.exit(1)
 
 # ===================================================================
-# 3. HELPERS
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===================================================================
 def safe_str(val: Any) -> str:
     if val is None: return ""
     if isinstance(val, dict):
-        for k in ['id', 'value', 'text', 'content', '_id', '$oid', 'mid']:
+        for k in ['id', 'value', 'text', 'content', '_id', '$oid', 'mid', 'url']:
             if k in val: return str(val[k]).strip()
         return str(val)
     return str(val).strip()
@@ -60,26 +60,35 @@ def safe_list(val: Any) -> List[Dict]:
                 return v if isinstance(v, list) else [v]
     return []
 
-# ===================================================================
-# 🔒 🔒 🔒 ИСПРАВЛЕННАЯ ФУНКЦИЯ ХЭШИРОВАНИЯ 🔒 🔒 🔒
-# ===================================================================
 def get_hash(msg: Dict) -> str:
-    """
-    Генерирует хэш ТОЛЬКО по стабильным полям.
-    Игнорирует динамические поля типа views, timestamp и т.д.
-    """
-    # Извлекаем mid из body или из корня
+    """Стабильный хэш ТОЛЬКО по mid (игнорирует views, timestamp и др.)"""
     body = msg.get("body", {}) if isinstance(msg.get("body"), dict) else {}
     mid = body.get("mid") or msg.get("id") or msg.get("message_id") or msg.get("_id") or ""
+    return hashlib.md5(str(mid).encode()).hexdigest()[:12] if mid else ""
+
+def guess_media_type(filename: str, att_type: str) -> str:
+    """Определяет тип медиа для Telegram API по расширению и типу из MAX"""
+    att_type = att_type.lower() if att_type else ""
+    ext = filename.split('.')[-1].lower() if '.' in filename else ""
     
-    # Логируем для отладки
-    logger.debug(f"[HASH-DEBUG] mid='{mid}' → hash='{hashlib.md5(str(mid).encode()).hexdigest()[:12]}'")
+    # Приоритет: явный тип из MAX
+    if att_type in ("photo", "image", "picture"): return "photo"
+    if att_type == "video": return "video"
+    if att_type == "audio": return "audio"
+    if att_type == "voice": return "voice"
+    if att_type == "sticker": return "document"
     
-    # Хэшируем только mid — он уникален и не меняется
-    return hashlib.md5(str(mid).encode()).hexdigest()[:12]
+    # Определение по расширению
+    if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"): return "photo"
+    if ext in ("mp4", "mov", "avi", "mkv", "webm", "flv", "m4v"): return "video"
+    if ext in ("mp3", "wav", "ogg", "m4a", "flac", "opus", "aac"): return "audio"
+    if ext in ("oga", "opus"): return "voice"  # Голосовые обычно в opus/oga
+    
+    # По умолчанию — документ
+    return "document"
 
 # ===================================================================
-# 4. TELEGRAM CLIENT
+# 4. TELEGRAM CLIENT (ВСЕ МЕТОДЫ ОТПРАВКИ)
 # ===================================================================
 class TelegramClient:
     def __init__(self, token: str, chat_id: str):
@@ -87,53 +96,104 @@ class TelegramClient:
         self.chat_id = chat_id
         self.base = f"https://api.telegram.org/bot{token}"
         self.session: Optional[aiohttp.ClientSession] = None
-        self.MAX_BYTES = 50 * 1024 * 1024
-        self.MAX_CAPTION = 1024
+        self.MAX_BYTES = 50 * 1024 * 1024  # 50 МБ — лимит Telegram Bot API
+        self.MAX_CAPTION = 1024             # Лимит подписи
 
     async def init(self):
         if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180))
+
+    async def _request(self, method: str, **kwargs) -> bool:
+        await self.init()
+        url = f"{self.base}/{method}"
+        try:
+            async with self.session.post(url, **kwargs) as r:
+                if r.status == 200:
+                    return True
+                err = await r.text()
+                logger.error(f"❌ TG {method} {r.status}: {err[:300]}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ TG {method} exception: {e}")
+            return False
 
     async def send_text(self, text: str) -> bool:
         if not text: return True
-        await self.init()
-        try:
-            async with self.session.post(f"{self.base}/sendMessage", json={
-                "chat_id": self.chat_id, "text": text, "parse_mode": "HTML"
-            }) as r:
-                if r.status == 200:
-                    logger.info(f"✅ Text sent: '{text[:50]}...'")
-                    return True
-                logger.error(f"❌ Text error {r.status}: {(await r.text())[:200]}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ Text exception: {e}")
-            return False
+        return await self._request("sendMessage", json={
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False
+        })
 
-    async def send_media(self, data: bytes, mtype: str, fname: str, caption: str = "") -> bool:
+    async def send_photo(self,  bytes, caption: str = "") -> bool:
         if len(data) > self.MAX_BYTES:
-            logger.warning(f"⚠️ Skipped >50MB: {fname}")
+            logger.warning(f"⚠️ Photo >50MB skipped")
             return False
         await self.init()
         form = aiohttp.FormData()
         form.add_field("chat_id", self.chat_id)
-        form.add_field(mtype.lower(), data, filename=fname)
+        form.add_field("photo", data, filename="photo.jpg")
         if caption:
             form.add_field("caption", caption[:self.MAX_CAPTION])
             form.add_field("parse_mode", "HTML")
-        try:
-            async with self.session.post(f"{self.base}/send{mtype.capitalize()}", data=form) as r:
-                if r.status == 200:
-                    logger.info(f"✅ Media ({mtype}) sent: {fname}")
-                    return True
-                logger.error(f"❌ Media error {r.status}: {(await r.text())[:200]}")
-                return False
-        except Exception as e:
-            logger.error(f"❌ Media exception: {e}")
+        return await self._request("sendPhoto", data=form)
+
+    async def send_video(self,  bytes, caption: str = "", filename: str = "video.mp4") -> bool:
+        if len(data) > self.MAX_BYTES:
+            logger.warning(f"⚠️ Video >50MB skipped: {filename}")
             return False
+        await self.init()
+        form = aiohttp.FormData()
+        form.add_field("chat_id", self.chat_id)
+        form.add_field("video", data, filename=filename)
+        form.add_field("supports_streaming", "true")  # Важно для видео
+        if caption:
+            form.add_field("caption", caption[:self.MAX_CAPTION])
+            form.add_field("parse_mode", "HTML")
+        return await self._request("sendVideo", data=form)
+
+    async def send_audio(self,  bytes, caption: str = "", filename: str = "audio.mp3") -> bool:
+        if len(data) > self.MAX_BYTES:
+            logger.warning(f"⚠️ Audio >50MB skipped: {filename}")
+            return False
+        await self.init()
+        form = aiohttp.FormData()
+        form.add_field("chat_id", self.chat_id)
+        form.add_field("audio", data, filename=filename)
+        if caption:
+            form.add_field("caption", caption[:self.MAX_CAPTION])
+            form.add_field("parse_mode", "HTML")
+        return await self._request("sendAudio", data=form)
+
+    async def send_voice(self,  bytes, caption: str = "") -> bool:
+        if len(data) > self.MAX_BYTES:
+            logger.warning(f"⚠️ Voice >50MB skipped")
+            return False
+        await self.init()
+        form = aiohttp.FormData()
+        form.add_field("chat_id", self.chat_id)
+        form.add_field("voice", data, filename="voice.ogg")
+        if caption:
+            form.add_field("caption", caption[:self.MAX_CAPTION])
+            form.add_field("parse_mode", "HTML")
+        return await self._request("sendVoice", data=form)
+
+    async def send_document(self,  bytes, caption: str = "", filename: str = "file.dat") -> bool:
+        if len(data) > self.MAX_BYTES:
+            logger.warning(f"⚠️ Document >50MB skipped: {filename}")
+            return False
+        await self.init()
+        form = aiohttp.FormData()
+        form.add_field("chat_id", self.chat_id)
+        form.add_field("document", data, filename=filename)
+        if caption:
+            form.add_field("caption", caption[:self.MAX_CAPTION])
+            form.add_field("parse_mode", "HTML")
+        return await self._request("sendDocument", data=form)
 
 # ===================================================================
-# 5. MAX CLIENT
+# 5. MAX CLIENT (ПОЛУЧЕНИЕ + СКАЧИВАНИЕ)
 # ===================================================================
 class MaxClient:
     def __init__(self, token: str, cid: str, base: str):
@@ -144,144 +204,243 @@ class MaxClient:
 
     async def init(self):
         if not self.session or self.session.closed:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
 
     async def fetch(self, limit: int = 5) -> List[Dict]:
         await self.init()
         try:
-            async with self.session.get(f"{self.base}/messages", headers={"Authorization": self.token}, params={"chat_id": self.cid, "limit": limit}) as r:
+            async with self.session.get(
+                f"{self.base}/messages",
+                headers={"Authorization": self.token},
+                params={"chat_id": self.cid, "limit": limit}
+            ) as r:
                 if r.status == 200:
                     raw = await r.json()
-                    logger.debug(f"[MAX-DEBUG] Raw response: {json.dumps(raw, ensure_ascii=False)[:500]}")
+                    logger.debug(f"[MAX] Raw response: {json.dumps(raw, ensure_ascii=False)[:600]}")
                     return safe_list(raw)
-                logger.error(f"❌ Max fetch error {r.status}")
+                logger.error(f"❌ MAX fetch HTTP {r.status}")
                 return []
         except Exception as e:
-            logger.error(f"❌ Max fetch exception: {e}")
+            logger.error(f"❌ MAX fetch exception: {e}")
             return []
 
     async def download(self, token: str) -> Optional[bytes]:
         await self.init()
         try:
-            async with self.session.get(f"{self.base}/files/{token}/download", headers={"Authorization": self.token}) as r:
+            async with self.session.get(
+                f"{self.base}/files/{token}/download",
+                headers={"Authorization": self.token}
+            ) as r:
                 if r.status == 200:
-                    return await r.read()
+                    <|fim_suffix|>
+                    logger.debug(f"[MAX] Downloaded {len(data)} bytes")
+                    return data
+                logger.warning(f"⚠️ MAX download HTTP {r.status}")
                 return None
         except Exception as e:
-            logger.error(f"❌ Download exception: {e}")
+            logger.error(f"❌ MAX download exception: {e}")
             return None
 
 # ===================================================================
-# 6. CORE LOGIC
+# 6. ОБРАБОТКА СООБЩЕНИЙ (ПОЛНАЯ ПОДДЕРЖКА ВСЕХ ФОРМАТОВ)
 # ===================================================================
 tg = TelegramClient(TG_TOKEN, TG_CHAT)
 mx = MaxClient(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 
-async def handle(msg: Dict):
-    logger.info(f"[HANDLE-DEBUG] Received msg: {json.dumps(msg, ensure_ascii=False)[:300]}")
+async def handle_message(msg: Dict):
+    logger.info(f"[HANDLE] Received: {json.dumps(msg, ensure_ascii=False)[:400]}")
     
-    # 🔒 Генерируем хэш по стабильному полю
+    # 🔒 Стабильный хэш только по mid
     h = get_hash(msg)
-    logger.info(f"[HASH-CHECK] Hash: {h} | In cache: {h in _processed}")
+    if not h:
+        logger.warning("[SKIP] Could not extract mid for hashing")
+        return
+    
+    logger.info(f"[HASH] mid hash: {h} | Already processed: {h in _processed}")
     
     if h in _processed:
-        logger.info(f"[DUPE-BLOCK] ✅ Already processed, skipping: {h}")
+        logger.info(f"[DUPE] Skip already processed: {h}")
         return
     
-    # 🔒 ДОБАВЛЯЕМ В КЭШ НЕМЕДЛЕННО
+    # 🔒 Немедленно добавляем в кэш ДО любой отправки
     _processed.add(h)
-    logger.info(f"[CACHE-ADD] ✅ Added to cache: {h} (size: {len(_processed)})")
+    logger.info(f"[CACHE] Added hash: {h} (cache size: {len(_processed)})")
 
-    # Извлечение полей
+    # Извлечение полей с учётом структуры MAX
     body = msg.get("body", {}) if isinstance(msg.get("body"), dict) else {}
-    mid = safe_str(body.get("mid") or msg.get("id") or msg.get("message_id") or msg.get("_id"))
-    text = safe_str(body.get("text") or msg.get("text") or msg.get("content") or msg.get("body") or msg.get("message") or (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None))
-    atts = safe_list(msg.get("attachments") or msg.get("files") or msg.get("media") or (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else []) or (body.get("attachments") if isinstance(body, dict) else []))
-
-    logger.info(f"📨 New msg | ID:{mid} | Hash:{h} | Text:{len(text)}c | Files:{len(atts)}")
+    mid = safe_str(body.get("mid") or msg.get("id") or msg.get("message_id"))
+    
+    # Текст: ищем в body.text, msg.text, msg.content, msg.body, msg.message
+    text = safe_str(
+        body.get("text") or 
+        msg.get("text") or 
+        msg.get("content") or 
+        (msg.get("body") if isinstance(msg.get("body"), str) else None) or 
+        msg.get("message") or
+        (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None)
+    )
+    
+    # Вложения: проверяем несколько уровней вложенности
+    attachments = safe_list(
+        body.get("attachments") or 
+        msg.get("attachments") or 
+        msg.get("files") or 
+        msg.get("media") or 
+        (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else []) or
+        (body.get("files") if isinstance(body, dict) else [])
+    )
+    
+    logger.info(f"📨 MSG | mid:{mid} | hash:{h} | text:{len(text)}c | attachments:{len(attachments)}")
 
     if not mid:
-        logger.info(f"[SKIP] Empty mid, skipping")
+        logger.info(f"[SKIP] Empty mid, skipping message")
         return
 
-    # Отправка текста
+    # ===================================================================
+    # ОТПРАВКА ТЕКСТА
+    # ===================================================================
     if text:
-        logger.info(f"[SEND-TEXT] Sending to TG: '{text[:100]}...'")
+        logger.info(f"[SEND-TEXT] '{text[:150]}{'...' if len(text) > 150 else ''}'")
         await tg.send_text(text)
 
-    # Отправка файлов
-    for i, att in enumerate(atts):
-        if not isinstance(att, dict): continue
-        atype = safe_str(att.get("type") or att.get("media_type") or "file").lower()
-        tok = safe_str(att.get("token") or att.get("file_token") or att.get("id"))
-        fn = safe_str(att.get("name") or att.get("filename") or "file.dat")
-        if not tok: 
-            logger.warning(f"[SKIP-ATT] No token in attachment #{i+1}")
+    # ===================================================================
+    # ОТПРАВКА ВЛОЖЕНИЙ (АЛЬБОМЫ, КОМБО, ВСЕ ТИПЫ)
+    # ===================================================================
+    for i, att in enumerate(attachments):
+        if not isinstance(att, dict):
+            logger.warning(f"[SKIP] Attachment #{i+1} is not dict: {type(att)}")
+            continue
+        
+        # Извлечение данных вложения
+        att_type = safe_str(att.get("type") or att.get("media_type") or att.get("mime_type") or "file")
+        token = safe_str(att.get("token") or att.get("file_token") or att.get("id") or att.get("file_id"))
+        filename = safe_str(att.get("name") or att.get("filename") or att.get("file_name") or f"file_{i+1}")
+        file_size = att.get("size") or att.get("file_size")
+        
+        logger.info(f"[ATT #{i+1}/{len(attachments)}] type:{att_type} | token:{token[:30]}... | name:{filename} | size:{file_size}")
+        
+        if not token:
+            logger.warning(f"[SKIP] No token in attachment #{i+1}")
             continue
 
-        logger.info(f"[DOWNLOAD] File #{i+1}: {fn} (token: {tok[:20]}...)")
-        data = await mx.download(tok)
-        if not data: 
-            logger.warning(f"[SKIP-ATT] Download failed: {fn}")
+        # Скачивание файла
+        logger.info(f"[DOWNLOAD] Starting: {filename}")
+        file_data = await mx.download(token)
+        
+        if file_data is None or len(file_data) == 0:
+            logger.error(f"[SKIP] Download failed or empty: {filename}")
             continue
+        
+        logger.info(f"[DOWNLOADED] {filename}: {len(file_data)} bytes")
 
-        tm = "Document"
-        if atype in ("image", "photo"): tm = "Photo"
-        elif atype == "video": tm = "Video"
-        elif atype == "audio": tm = "Audio"
-        elif atype == "voice": tm = "Voice"
-        elif atype == "file":
-            ext = fn.split('.')[-1].lower() if '.' in fn else ''
-            if ext in ('mp4','mov','avi','mkv','webm'): tm = "Video"
-            elif ext in ('mp3','wav','ogg','m4a'): tm = "Audio"
+        # Определение типа для Telegram
+        tg_type = guess_media_type(filename, att_type)
+        logger.info(f"[MEDIA-TYPE] Detected: {tg_type} (from att_type:{att_type}, ext:{filename.split('.')[-1] if '.' in filename else 'none'})")
 
-        logger.info(f"[SEND-MEDIA] Sending {tm}: {fn}")
-        await tg.send_media(data, tm, fn, caption=text if tm != "Document" else "")
+        # Подготовка подписи
+        caption = text if text and tg_type != "document" else ""
+        if caption and len(caption) > tg.MAX_CAPTION:
+            caption = caption[:tg.MAX_CAPTION - 3] + "..."
+            logger.warning(f"[CAPTION] Truncated to {tg.MAX_CAPTION} chars")
+
+        # Отправка в Telegram
+        logger.info(f"[SEND-{tg_type.upper()}] {filename} | caption:{bool(caption)}")
+        sent = False
+        
+        try:
+            if tg_type == "photo":
+                sent = await tg.send_photo(file_data, caption)
+            elif tg_type == "video":
+                sent = await tg.send_video(file_data, caption, filename)
+            elif tg_type == "audio":
+                sent = await tg.send_audio(file_data, caption, filename)
+            elif tg_type == "voice":
+                sent = await tg.send_voice(file_data, caption)
+            else:  # document
+                sent = await tg.send_document(file_data, caption, filename)
+        except Exception as e:
+            logger.error(f"❌ Send exception: {e}")
+            sent = False
+        
+        if sent:
+            logger.info(f"✅ Sent {tg_type}: {filename}")
+        else:
+            logger.error(f"❌ Failed to send {tg_type}: {filename}")
+        
+        # Пауза между файлами (чтобы Telegram не забанил за спам)
         await asyncio.sleep(0.3)
 
-    logger.info(f"✅ Done: {mid} (hash:{h})")
+    logger.info(f"✅ DONE: {mid} (hash:{h}) | attachments processed: {len(attachments)}")
 
 # ===================================================================
-# 7. POLLING & SERVER
+# 7. POLLING LOOP + WEB SERVER
 # ===================================================================
-async def loop():
-    logger.info("⏳ Stabilizing & syncing cache...")
-    await asyncio.sleep(2)
+async def polling_loop():
+    logger.info("🔄 Starting polling loop...")
+    
+    # Синхронизация при старте: кешируем последние сообщения
+    logger.info("⏳ Sync: caching recent messages to avoid duplicates...")
+    await asyncio.sleep(2)  # Ждём готовности сети Render
     
     init_msgs = await mx.fetch(limit=50)
     for m in init_msgs:
         h = get_hash(m)
-        _processed.add(h)
-        logger.info(f"[STARTUP-CACHE] Cached: {h}")
-    logger.info(f"📦 Cached {len(_processed)} messages on startup")
+        if h:
+            _processed.add(h)
+    logger.info(f"📦 Cached {len(_processed)} message hashes at startup")
 
-    i = 0
+    poll_count = 0
     while True:
-        i += 1
-        logger.debug(f"[POLL] Iteration #{i}")
+        poll_count += 1
+        logger.debug(f"[POLL] Iteration #{poll_count}")
+        
         try:
-            msgs = await mx.fetch(limit=1)
-            logger.debug(f"[POLL] Got {len(msgs)} messages")
-            if msgs:
-                logger.info(f"[POLL] Processing new message...")
-                await handle(msgs[0])
+            # Берём только самое новое сообщение
+            messages = await mx.fetch(limit=1)
+            logger.debug(f"[POLL] Received {len(messages)} messages from MAX")
+            
+            if messages:
+                logger.info(f"[POLL] Processing newest message...")
+                await handle_message(messages[0])
+            else:
+                logger.debug("[POLL] No new messages")
+                
         except Exception as e:
-            logger.error(f"❌ Loop error: {e}", exc_info=True)
+            logger.error(f"❌ Polling loop error: {e}", exc_info=True)
+        
         await asyncio.sleep(POLL_SEC)
 
-async def health(req):
-    return web.json_response({"status": "ok", "cached": len(_processed)})
+async def health_handler(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "max-to-telegram-forwarder",
+        "cached_hashes": len(_processed),
+        "poll_interval": POLL_SEC
+    })
 
-async def run():
+async def run_app():
     app = web.Application()
-    app.router.add_get('/health', health)
+    app.router.add_get('/health', health_handler)
+    
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 8080).start()
-    logger.info("🌐 Server on :8080 | UptimeRobot ready")
-    await loop()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    
+    logger.info("🌐 Health server running on :8080 (UptimeRobot compatible)")
+    
+    # Запускаем polling
+    await polling_loop()
 
+# ===================================================================
+# 8. ЗАПУСК
+# ===================================================================
 if __name__ == '__main__':
-    try: asyncio.run(run())
-    except KeyboardInterrupt: logger.info("🛑 Stopped")
-    except Exception as e: logger.exception(f"💥 Fatal: {e}"); sys.exit(1)
+    try:
+        logger.info("🚀 Starting MAX → Telegram Forwarder...")
+        asyncio.run(run_app())
+    except KeyboardInterrupt:
+        logger.info("🛑 Stopped by user (Ctrl+C)")
+    except Exception as e:
+        logger.exception(f"💥 FATAL ERROR: {e}")
+        sys.exit(1)
