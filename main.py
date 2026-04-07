@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
-import os
-import sys
-import asyncio
-import logging
-import aiohttp
-import json
-import hashlib
+import os, sys, asyncio, logging, aiohttp, json, hashlib
 from aiohttp import web
 from typing import List, Dict, Optional, Any
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (МАКСИМАЛЬНЫЙ УРОВЕНЬ)
+# 1. ЛОГИРОВАНИЕ
 # ===================================================================
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -23,33 +17,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# 2. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# 2. ПЕРЕМЕННЫЕ
 # ===================================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TG_CHAT  = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHAN  = os.getenv('MAX_CHANNEL_ID', '').strip()
 MAX_BASE  = os.getenv('MAX_API_BASE', 'https://platform-api.max.ru')
-POLL_SEC  = int(os.getenv('POLL_INTERVAL', '3'))
+POLL_SEC  = int(os.getenv('POLL_INTERVAL', '1'))  # ← ← ← 1 СЕКУНДА!
 
-# Хранилище для защиты от дублей
-_processed_hashes = set()
+_processed = set()  # Кэш обработанных хэшей
 
-logger.info("=" * 80)
-logger.info("🚀 ЗАПУСК БОТА (MAX -> TELEGRAM) [DUPE-FIX ENABLED]")
-logger.info(f"📡 Источник (MAX) : {MAX_CHAN}")
-logger.info(f"📥 Назначение (TG) : {TG_CHAT}")
-logger.info(f"🔗 MAX API Base    : {MAX_BASE}")
-logger.info(f"⏱️ Интервал опроса  : {POLL_SEC} сек")
-logger.info("🔒 DUPE-FIX: Hash added to cache BEFORE sending")
-logger.info("=" * 80)
+logger.info("=" * 70)
+logger.info("🚀 MAX → TG FORWARDER [1-SEC POLLING]")
+logger.info(f"📡 Channel: {MAX_CHAN} | 📥 Chat: {TG_CHAT}")
+logger.info(f"🔗 API: {MAX_BASE} | ⏱️ Interval: {POLL_SEC}s")
+logger.info("=" * 70)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
-    logger.critical("❌ НЕ ХВАТАЕТ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ!")
+    logger.critical("❌ Missing environment variables. Check Render settings.")
     sys.exit(1)
 
 # ===================================================================
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 3. HELPERS
 # ===================================================================
 def safe_str(val: Any) -> str:
     if val is None: return ""
@@ -61,8 +51,7 @@ def safe_str(val: Any) -> str:
 
 def safe_list(val: Any) -> List[Dict]:
     if val is None: return []
-    if isinstance(val, list): 
-        return [v for v in val if isinstance(v, dict)]
+    if isinstance(val, list): return [v for v in val if isinstance(v, dict)]
     if isinstance(val, dict):
         for k in ['messages', 'items', 'data', 'result', 'message', 'attachments', 'files', 'media']:
             if k in val:
@@ -70,9 +59,8 @@ def safe_list(val: Any) -> List[Dict]:
                 return v if isinstance(v, list) else [v]
     return []
 
-def get_msg_hash(msg: Dict) -> str:
-    raw = json.dumps(msg, sort_keys=True, ensure_ascii=False)
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
+def get_hash(msg: Dict) -> str:
+    return hashlib.md5(json.dumps(msg, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:12]
 
 # ===================================================================
 # 4. TELEGRAM CLIENT
@@ -81,259 +69,180 @@ class TelegramClient:
     def __init__(self, token: str, chat_id: str):
         self.token = token
         self.chat_id = chat_id
-        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.base = f"https://api.telegram.org/bot{token}"
         self.session: Optional[aiohttp.ClientSession] = None
-        self.LIMIT_BYTES = 50 * 1024 * 1024
-        self.LIMIT_CAPTION = 1024
+        self.MAX_BYTES = 50 * 1024 * 1024
+        self.MAX_CAPTION = 1024
 
-    async def init_session(self):
-        if self.session is None or self.session.closed:
+    async def init(self):
+        if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
 
     async def send_text(self, text: str) -> bool:
         if not text: return True
-        await self.init_session()
-        url = f"{self.base_url}/sendMessage"
-        payload = {"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"}
+        await self.init()
         try:
-            async with self.session.post(url, json=payload) as resp:
-                if resp.status == 200:
-                    logger.info(f"✅ TG Текст: '{text[:50]}...'")
+            async with self.session.post(f"{self.base}/sendMessage", json={
+                "chat_id": self.chat_id, "text": text, "parse_mode": "HTML"
+            }) as r:
+                if r.status == 200:
+                    logger.info(f"✅ Text sent: '{text[:50]}...'")
                     return True
-                err = await resp.text()
-                logger.error(f"❌ TG Текст: {resp.status} | {err[:300]}")
+                logger.error(f"❌ Text error {r.status}: {(await r.text())[:200]}")
                 return False
         except Exception as e:
-            logger.error(f"❌ TG Текст exception: {e}")
+            logger.error(f"❌ Text exception: {e}")
             return False
 
-    async def send_media(self, file_bytes: bytes, media_type: str, filename: str, caption: str = "") -> bool:
-        if len(file_bytes) > self.LIMIT_BYTES:
-            logger.warning(f"⚠️ Файл >50МБ пропущен: {filename} ({len(file_bytes)/1024/1024:.2f} МБ)")
+    async def send_media(self, data: bytes, mtype: str, fname: str, caption: str = "") -> bool:
+        if len(data) > self.MAX_BYTES:
+            logger.warning(f"⚠️ Skipped >50MB: {fname}")
             return False
-        await self.init_session()
-        url = f"{self.base_url}/send{media_type.capitalize()}"
-        data = aiohttp.FormData()
-        data.add_field("chat_id", self.chat_id)
-        data.add_field(media_type.lower(), file_bytes, filename=filename)
+        await self.init()
+        form = aiohttp.FormData()
+        form.add_field("chat_id", self.chat_id)
+        form.add_field(mtype.lower(), data, filename=fname)
         if caption:
-            data.add_field("caption", caption[:self.LIMIT_CAPTION])
-            data.add_field("parse_mode", "HTML")
+            form.add_field("caption", caption[:self.MAX_CAPTION])
+            form.add_field("parse_mode", "HTML")
         try:
-            async with self.session.post(url, data=data) as resp:
-                if resp.status == 200:
-                    logger.info(f"✅ TG Медиа ({media_type}): {filename}")
+            async with self.session.post(f"{self.base}/send{mtype.capitalize()}", data=form) as r:
+                if r.status == 200:
+                    logger.info(f"✅ Media ({mtype}) sent: {fname}")
                     return True
-                err = await resp.text()
-                logger.error(f"❌ TG Медиа: {resp.status} | {err[:300]}")
+                logger.error(f"❌ Media error {r.status}: {(await r.text())[:200]}")
                 return False
         except Exception as e:
-            logger.error(f"❌ TG Медиа exception: {e}")
+            logger.error(f"❌ Media exception: {e}")
             return False
 
 # ===================================================================
 # 5. MAX CLIENT
 # ===================================================================
 class MaxClient:
-    def __init__(self, token: str, channel_id: str, base_url: str):
+    def __init__(self, token: str, cid: str, base: str):
         self.token = token
-        self.channel_id = channel_id
-        self.base_url = base_url
+        self.cid = cid
+        self.base = base
         self.session: Optional[aiohttp.ClientSession] = None
 
-    async def init_session(self):
-        if self.session is None or self.session.closed:
+    async def init(self):
+        if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
 
-    async def get_messages(self, limit: int = 5) -> List[Dict]:
-        await self.init_session()
-        url = f"{self.base_url}/messages"
-        headers = {"Authorization": self.token}
-        params = {"chat_id": self.channel_id, "limit": limit}
+    async def fetch(self, limit: int = 5) -> List[Dict]:
+        await self.init()
         try:
-            async with self.session.get(url, headers=headers, params=params) as resp:
-                if resp.status == 200:
-                    raw = await resp.json()
-                    logger.debug(f"📦 MAX raw: {json.dumps(raw, ensure_ascii=False)[:800]}")
-                    return safe_list(raw)
-                logger.error(f"❌ MAX API: {resp.status}")
+            async with self.session.get(f"{self.base}/messages", headers={"Authorization": self.token}, params={"chat_id": self.cid, "limit": limit}) as r:
+                if r.status == 200:
+                    return safe_list(await r.json())
                 return []
         except Exception as e:
-            logger.error(f"❌ MAX request: {e}")
+            logger.error(f"❌ Max fetch error: {e}")
             return []
 
-    async def download_file(self, file_token: str) -> Optional[bytes]:
-        await self.init_session()
-        url = f"{self.base_url}/files/{file_token}/download"
-        headers = {"Authorization": self.token}
+    async def download(self, token: str) -> Optional[bytes]:
+        await self.init()
         try:
-            async with self.session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                return None
+            async with self.session.get(f"{self.base}/files/{token}/download", headers={"Authorization": self.token}) as r:
+                return await r.read() if r.status == 200 else None
         except Exception as e:
-            logger.error(f"❌ Download: {e}")
+            logger.error(f"❌ Download error: {e}")
             return None
 
 # ===================================================================
-# 6. ОБРАБОТКА СООБЩЕНИЙ [ИСПРАВЛЕНА: DUPE-FIX]
+# 6. CORE LOGIC
 # ===================================================================
-tg_client = TelegramClient(TG_TOKEN, TG_CHAT)
-max_client = MaxClient(MAX_TOKEN, MAX_CHAN, MAX_BASE)
+tg = TelegramClient(TG_TOKEN, TG_CHAT)
+mx = MaxClient(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 
-async def process_message(msg: Dict):
-    # [DUPE-FIX LOG] Начало обработки
-    logger.info(f"[DUPE-FIX] ▶️ START process_message")
-    logger.debug(f"🔍 RAW: {json.dumps(msg, ensure_ascii=False)[:500]}")
-    
-    # Извлечение полей
-    msg_id = safe_str(
-        msg.get("id") or msg.get("message_id") or msg.get("_id") or 
-        msg.get("msgId") or msg.get("uid") or msg.get("messageId") or
-        (msg.get("body", {}).get("mid") if isinstance(msg.get("body"), dict) else None)
-    )
-    
-    text = safe_str(
-        msg.get("text") or msg.get("content") or msg.get("body") or 
-        msg.get("message") or 
-        (msg.get("body", {}).get("text") if isinstance(msg.get("body"), dict) else None) or
-        (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None)
-    )
-    
-    attachments = safe_list(
-        msg.get("attachments") or msg.get("files") or msg.get("media") or 
-        (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else []) or
-        (msg.get("body", {}).get("attachments") if isinstance(msg.get("body"), dict) else [])
-    )
-    
-    # Генерация хэша
-    h = get_msg_hash(msg)
-    logger.info(f"🆕 MSG | ID:'{msg_id}' | Hash:'{h}' | Text:{len(text)}c | Att:{len(attachments)}")
-    
-    # ===================================================================
-    # 🔒 DUPE-FIX: Добавляем в кэш СРАЗУ, ДО любой отправки!
-    # ===================================================================
-    if h in _processed_hashes:
-        logger.info(f"[DUPE-FIX] ⏭ ALREADY CACHED - Skip: {h}")
-        logger.info(f"[DUPE-FIX] ✅ END process_message (skipped)")
-        return
-    
-    # 🔒 КЛЮЧЕВОЙ ФИКС: Добавляем хэш в кэш НЕМЕДЛЕННО
-    _processed_hashes.add(h)
-    logger.info(f"[DUPE-FIX] 🔒 Hash ADDED to cache BEFORE sending: {h}")
-    logger.info(f"[DUPE-FIX] Cache size: {len(_processed_hashes)}")
-    
-    # Очистка памяти
-    if len(_processed_hashes) > 1000:
-        _processed_hashes.clear()
-        logger.debug("🧹 Cleared old hashes")
-    
-    # Пропуск служебных сообщений с пустым ID
-    if not msg_id:
-        logger.info(f"[DUPE-FIX] ⏭ Skip empty ID (hash:{h})")
-        logger.info(f"[DUPE-FIX] ✅ END process_message (empty ID)")
-        return
-    
-    # ===================================================================
-    # ОТПРАВКА В TELEGRAM
-    # ===================================================================
-    
-    # Отправка текста
+async def handle(msg: Dict):
+    h = get_hash(msg)
+    if h in _processed:
+        return  # Already processed
+    _processed.add(h)  # 🔒 LOCK IMMEDIATELY
+
+    # Extract fields
+    mid = safe_str(msg.get("id") or msg.get("message_id") or msg.get("_id") or 
+                   msg.get("msgId") or msg.get("uid") or 
+                   (msg.get("body", {}).get("mid") if isinstance(msg.get("body"), dict) else None))
+    text = safe_str(msg.get("text") or msg.get("content") or msg.get("body") or 
+                    msg.get("message") or 
+                    (msg.get("body", {}).get("text") if isinstance(msg.get("body"), dict) else None) or
+                    (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None))
+    atts = safe_list(msg.get("attachments") or msg.get("files") or msg.get("media") or 
+                     (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else []) or
+                     (msg.get("body", {}).get("attachments") if isinstance(msg.get("body"), dict) else []))
+
+    logger.info(f"📨 New msg | ID:{mid} | Hash:{h} | Text:{len(text)}c | Files:{len(atts)}")
+
+    if not mid:
+        return  # Skip service messages
+
+    # Send text
     if text:
-        logger.info(f"[DUPE-FIX] 📤 SENDING TEXT to TG: '{text[:100]}...' (hash:{h})")
-        send_result = await tg_client.send_text(text)
-        logger.info(f"[DUPE-FIX] 📤 Text send result: {'✅ OK' if send_result else '❌ FAILED'} (hash:{h})")
-    
-    # Отправка файлов
-    for i, att in enumerate(attachments):
+        await tg.send_text(text)
+
+    # Send files
+    for att in atts:
         if not isinstance(att, dict): continue
-        att_type = safe_str(att.get("type") or att.get("media_type") or "file").lower()
-        token = safe_str(att.get("token") or att.get("file_token") or att.get("id"))
-        filename = safe_str(att.get("name") or att.get("filename") or "file.dat")
-        if not token: continue
-        
-        logger.info(f"[DUPE-FIX] 📥 Downloading file #{i+1}: {filename} (hash:{h})")
-        file_bytes = await max_client.download_file(token)
-        if not file_bytes:
-            logger.info(f"[DUPE-FIX] ⚠️ Download failed: {filename} (hash:{h})")
-            continue
-        
-        tg_type = "Document"
-        if att_type in ("image", "photo"): tg_type = "Photo"
-        elif att_type == "video": tg_type = "Video"
-        elif att_type == "audio": tg_type = "Audio"
-        elif att_type == "voice": tg_type = "Voice"
-        elif att_type == "file":
-            ext = filename.split('.')[-1].lower() if '.' in filename else ''
-            if ext in ('mp4', 'mov', 'avi', 'mkv', 'webm'): tg_type = "Video"
-            elif ext in ('mp3', 'wav', 'ogg', 'm4a'): tg_type = "Audio"
-        
-        logger.info(f"[DUPE-FIX] 📤 SENDING MEDIA ({tg_type}) to TG: {filename} (hash:{h})")
-        media_result = await tg_client.send_media(file_bytes, tg_type, filename, caption=text if tg_type != "Document" else "")
-        logger.info(f"[DUPE-FIX] 📤 Media send result: {'✅ OK' if media_result else '❌ FAILED'} (hash:{h})")
-        
-        await asyncio.sleep(0.5)
-    
-    # ===================================================================
-    # ЗАВЕРШЕНИЕ
-    # ===================================================================
-    logger.info(f"[DUPE-FIX] ✅ END process_message - Fully processed: {msg_id} (hash:{h})")
-    logger.info(f"[DUPE-FIX] Cache size after: {len(_processed_hashes)}")
+        atype = safe_str(att.get("type") or att.get("media_type") or "file").lower()
+        tok = safe_str(att.get("token") or att.get("file_token") or att.get("id"))
+        fn = safe_str(att.get("name") or att.get("filename") or "file.dat")
+        if not tok: continue
+
+        data = await mx.download(tok)
+        if not data: continue
+
+        tm = "Document"
+        if atype in ("image", "photo"): tm = "Photo"
+        elif atype == "video": tm = "Video"
+        elif atype == "audio": tm = "Audio"
+        elif atype == "voice": tm = "Voice"
+        elif atype == "file":
+            ext = fn.split('.')[-1].lower() if '.' in fn else ''
+            if ext in ('mp4','mov','avi','mkv','webm'): tm = "Video"
+            elif ext in ('mp3','wav','ogg','m4a'): tm = "Audio"
+
+        await tg.send_media(data, tm, fn, caption=text if tm != "Document" else "")
+        await asyncio.sleep(0.3)
+
+    logger.info(f"✅ Done: {mid} (hash:{h})")
 
 # ===================================================================
-# 7. POLLING LOOP
+# 7. POLLING & SERVER
 # ===================================================================
-async def polling_loop():
-    logger.info("🔄 Polling started...")
-    
-    # Синхронизация при старте
-    logger.info("⏳ Sync: caching last 10 messages...")
-    init_msgs = await max_client.get_messages(limit=10)
-    for msg in init_msgs:
-        h = get_msg_hash(msg)
-        _processed_hashes.add(h)
-        logger.info(f"[DUPE-FIX] 🔒 Cached at startup: {h}")
-    logger.info(f"📍 Total cached at startup: {len(_processed_hashes)}")
-    
-    poll_count = 0
+async def loop():
+    logger.info("⏳ Stabilizing & syncing cache...")
+    await asyncio.sleep(2)  # Wait for Render networking
+    for m in await mx.fetch(limit=50):
+        _processed.add(get_hash(m))
+    logger.info(f"📦 Cached {len(_processed)} messages on startup")
+
+    i = 0
     while True:
-        poll_count += 1
-        logger.debug(f"🔄 Poll iteration #{poll_count}")
+        i += 1
         try:
-            messages = await max_client.get_messages(limit=1)
-            logger.debug(f"📬 Got {len(messages)} messages from MAX")
-            if messages:
-                logger.info(f"[DUPE-FIX] 📨 New message detected, calling process_message...")
-                await process_message(messages[0])
-            else:
-                logger.debug("📭 No new messages")
+            msgs = await mx.fetch(limit=1)
+            if msgs:
+                await handle(msgs[0])
         except Exception as e:
-            logger.error(f"❌ Poll error: {e}", exc_info=True)
+            logger.error(f"❌ Loop error: {e}", exc_info=True)
         await asyncio.sleep(POLL_SEC)
 
-# ===================================================================
-# 8. WEB SERVER (HEALTH CHECK)
-# ===================================================================
-async def health_handler(request):
-    return web.json_response({"status": "ok", "processed": len(_processed_hashes)})
+async def health(req):
+    return web.json_response({"status": "ok", "cached": len(_processed)})
 
-async def run_app():
+async def run():
     app = web.Application()
-    app.router.add_get('/health', health_handler)
+    app.router.add_get('/health', health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 8080).start()
-    logger.info("🌐 Health server on :8080")
-    await polling_loop()
+    logger.info("🌐 Server on :8080 | UptimeRobot ready")
+    await loop()
 
-# ===================================================================
-# 9. ЗАПУСК
-# ===================================================================
 if __name__ == '__main__':
-    try:
-        asyncio.run(run_app())
-    except KeyboardInterrupt:
-        logger.info("🛑 Stopped by user")
-    except Exception as e:
-        logger.exception(f"💥 Fatal error: {e}")
-        sys.exit(1)
+    try: asyncio.run(run())
+    except KeyboardInterrupt: logger.info("🛑 Stopped")
+    except Exception as e: logger.exception(f"💥 Fatal: {e}"); sys.exit(1)
