@@ -13,7 +13,7 @@ from typing import List, Dict, Optional, Any
 # 1. НАСТРОЙКА ЛОГИРОВАНИЯ (МАКСИМАЛЬНАЯ ДЕТАЛИЗАЦИЯ)
 # ===================================================================
 logging.basicConfig(
-    level=logging.DEBUG,  # Уровень DEBUG покажет сырые ответы от MAX
+    level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -140,7 +140,6 @@ class TelegramClient:
         
         data = aiohttp.FormData()
         data.add_field("chat_id", self.chat_id)
-        # Telegram требует, чтобы поле называлось так же, как тип (photo, video и т.д.)
         data.add_field(media_type.lower(), file_bytes, filename=filename)
         
         if caption:
@@ -213,11 +212,7 @@ class MaxClient:
         try:
             async with self.session.get(url, headers=headers) as resp:
                 if resp.status == 200:
-                    logger.debug(f"✅ Файл скачан успешно ({len(await resp.read())} байт)")
-                    # Внимание: resp.read() можно вызвать только один раз, поэтому читаем здесь
-                    # Но мы уже вызвали read() в проверке выше? Нет, в check выше только status.
-                    # Исправление: читаем тело только если статус 200
-                    return await resp.read() 
+                    return await resp.read()
                 else:
                     logger.warning(f"⚠️ Не удалось скачать файл: HTTP {resp.status}")
                     return None
@@ -226,7 +221,7 @@ class MaxClient:
             return None
 
 # ===================================================================
-# 6. ГЛАВНАЯ ЛОГИКА (ОБРАБОТКА СООБЩЕНИЙ)
+# 6. ГЛАВНАЯ ЛОГИКА (ОБРАБОТКА СООБЩЕНИЙ) — ИСПРАВЛЕННАЯ ДЛЯ MAX STRUCTURE
 # ===================================================================
 tg_client = TelegramClient(TG_TOKEN, TG_CHAT)
 max_client = MaxClient(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -237,24 +232,28 @@ async def process_message(msg: Dict):
     # 1. Логирование сырого сообщения (для отладки)
     logger.debug(f"🔍 Обработка сообщения: {json.dumps(msg, ensure_ascii=False)[:500]}")
     
-    # 2. Безопасное извлечение полей
-    # MAX может называть ID по-разному, пробуем все варианты
+    # 2. Безопасное извлечение полей — С УЧЁТОМ ВЛОЖЕННОСТИ В "body"
+    
+    # 🔹 ID: MAX кладёт его в body.mid
     msg_id = safe_str(
         msg.get("id") or msg.get("message_id") or msg.get("_id") or 
-        msg.get("msgId") or msg.get("uid") or msg.get("messageId")
+        msg.get("msgId") or msg.get("uid") or msg.get("messageId") or
+        (msg.get("body", {}).get("mid") if isinstance(msg.get("body"), dict) else None)
     )
     
-    # Текст
+    # 🔹 Текст: MAX кладёт его в body.text
     text = safe_str(
         msg.get("text") or msg.get("content") or msg.get("body") or 
         msg.get("message") or 
+        (msg.get("body", {}).get("text") if isinstance(msg.get("body"), dict) else None) or
         (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None)
     )
     
-    # Вложения (картинки, файлы)
+    # 🔹 Вложения
     attachments = safe_list(
         msg.get("attachments") or msg.get("files") or msg.get("media") or 
-        (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else [])
+        (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else []) or
+        (msg.get("body", {}).get("attachments") if isinstance(msg.get("body"), dict) else [])
     )
     
     # 3. Генерация хэша для защиты от дублей
@@ -273,7 +272,6 @@ async def process_message(msg: Dict):
         logger.debug("🧹 Очищен кэш хэшей")
 
     # 5. Пропуск сообщений с пустым ID (служебные)
-    # НО мы уже запомнили хэш, так что зацикливания не будет
     if not msg_id:
         logger.debug("⏭ Пропуск: пустой ID (вероятно, служебное сообщение)")
         return
@@ -308,7 +306,6 @@ async def process_message(msg: Dict):
             continue
 
         # Маппинг типов MAX -> Telegram
-        # Telegram принимает: Photo, Video, Audio, Document, Voice
         tg_type = "Document" # По умолчанию
         
         if att_type in ["image", "photo"]:
@@ -326,14 +323,12 @@ async def process_message(msg: Dict):
                 tg_type = "Video"
             elif ext in ['mp3', 'wav', 'ogg', 'm4a', 'flac']:
                 tg_type = "Audio"
-            # Остальное пойдет как Document
 
         logger.info(f"📤 Отправляю файл {filename} как {tg_type}")
-        # caption передаем, только если это не просто документ (чтобы не дублировать текст)
         caption = text if tg_type != "Document" else ""
         await tg_client.send_media(file_bytes, tg_type, filename, caption=caption)
         
-        # Пауза между файлами, чтобы Telegram не забанил за спам
+        # Пауза между файлами
         await asyncio.sleep(0.5)
 
     logger.info(f"✅ Сообщение {msg_id} полностью обработано")
