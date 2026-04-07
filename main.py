@@ -5,8 +5,7 @@ import asyncio
 import logging
 import aiohttp
 import json
-from aiohttp import web
-from typing import Optional
+from typing import Optional, List, Dict
 
 # ===================================================================
 # НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -28,14 +27,13 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHANNEL_ID = os.getenv('MAX_CHANNEL_ID', '').strip()
-MAX_WEBHOOK_SECRET = os.getenv('MAX_WEBHOOK_SECRET', '').strip()
-BASE_URL = os.getenv('RENDER_EXTERNAL_URL', 'https://max-to-telegram-bot.onrender.com')
+POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '3'))  # Опрос каждые 3 секунды
 
 logger.info("=" * 80)
-logger.info("🚀 ЗАПУСК БОТА-ПЕРЕСЫЛЬЩИКА (MAX -> TELEGRAM)")
+logger.info("🚀 ЗАПУСК БОТА-ПЕРЕСЫЛЬЩИКА (MAX -> TELEGRAM) [POLLING]")
 logger.info(f"📢 MAX Channel: {MAX_CHANNEL_ID}")
 logger.info(f"👥 TG Chat: {TELEGRAM_CHAT_ID}")
-logger.info(f"🔗 Webhook URL: {BASE_URL}/webhook")
+logger.info(f"⏱️ Poll Interval: {POLL_INTERVAL} sec")
 logger.info("=" * 80)
 
 # 🔹 ПРОВЕРКА ПЕРЕМЕННЫХ
@@ -48,8 +46,6 @@ if not MAX_TOKEN:
     missing.append('MAX_TOKEN')
 if not MAX_CHANNEL_ID:
     missing.append('MAX_CHANNEL_ID')
-if not MAX_WEBHOOK_SECRET:
-    missing.append('MAX_WEBHOOK_SECRET')
 
 if missing:
     logger.error("❌ ОТСУТСТВУЮТ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:")
@@ -64,6 +60,7 @@ logger.info("=" * 80)
 # СЕССИЯ AIOHTTP
 # ===================================================================
 session: Optional[aiohttp.ClientSession] = None
+last_message_id: Optional[int] = None
 
 async def get_session() -> aiohttp.ClientSession:
     global session
@@ -102,7 +99,7 @@ class TelegramClient:
     async def send_photo(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
         try:
             if len(file_bytes) > 50 * 1024 * 1024:
-                logger.warning(f"⚠️ Фото пропущено (>50MB): {len(file_bytes)} bytes")
+                logger.warning(f"⚠️ Фото пропущено (>50MB)")
                 return False
             
             sess = await get_session()
@@ -122,7 +119,7 @@ class TelegramClient:
     async def send_video(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
         try:
             if len(file_bytes) > 50 * 1024 * 1024:
-                logger.warning(f"⚠️ Видео пропущено (>50MB): {len(file_bytes)} bytes")
+                logger.warning(f"⚠️ Видео пропущено (>50MB)")
                 return False
             
             sess = await get_session()
@@ -142,7 +139,7 @@ class TelegramClient:
     async def send_document(self, chat_id: str, file_bytes: bytes, filename: str, caption: str = "") -> bool:
         try:
             if len(file_bytes) > 50 * 1024 * 1024:
-                logger.warning(f"⚠️ Файл пропущен (>50MB): {len(file_bytes)} bytes")
+                logger.warning(f"⚠️ Файл пропущен (>50MB)")
                 return False
 
             sess = await get_session()
@@ -179,14 +176,35 @@ class TelegramClient:
             return False
 
 # ===================================================================
-# MAX API CLIENT
+# MAX API CLIENT (POLLING)
 # ===================================================================
 class MaxClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str, channel_id: str):
         self.token = token
+        self.channel_id = channel_id
         self.base_url = "https://platform-api.max.ru"
 
+    async def get_messages(self, limit: int = 10) -> Optional[List[Dict]]:
+        """Получение последних сообщений из канала Max"""
+        try:
+            sess = await get_session()
+            # Адаптируйте эндпоинт под реальное API Max
+            async with sess.get(
+                f"{self.base_url}/channels/{self.channel_id}/messages",
+                headers={"Authorization": self.token},
+                params={"limit": limit}
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get('messages', [])
+                logger.error(f"❌ Max API error: {resp.status}")
+                return None
+        except Exception as e:
+            logger.error(f"❌ get_messages exception: {e}")
+            return None
+
     async def download_file(self, file_token: str) -> Optional[bytes]:
+        """Скачивание файла из Max"""
         try:
             sess = await get_session()
             async with sess.get(
@@ -197,22 +215,24 @@ class MaxClient:
                     return await resp.read()
                 return None
         except Exception as e:
-            logger.error(f"❌ Max download_file exception: {e}")
+            logger.error(f"❌ download_file exception: {e}")
             return None
 
 # ===================================================================
-# ОБРАБОТЧИК
+# ОБРАБОТЧИК СООБЩЕНИЙ
 # ===================================================================
 tg_client = TelegramClient(TELEGRAM_BOT_TOKEN)
-max_client = MaxClient(MAX_TOKEN)
+max_client = MaxClient(MAX_TOKEN, MAX_CHANNEL_ID)
 
-async def process_max_data(data: dict) -> bool:
+async def process_max_message( Dict) -> bool:
+    """Обработка одного сообщения из Max"""
     try:
         text = data.get("text", "")
         attachments = data.get("attachments", [])
         msg_format = data.get("format", "HTML")
+        message_id = data.get("id")
         
-        logger.info(f"📨 Получено сообщение от Max: {len(text)} символов, {len(attachments)} вложений")
+        logger.info(f"📨 Обработка сообщения #{message_id} из Max")
 
         # 1. Отправка текста
         if text:
@@ -256,49 +276,68 @@ async def process_max_data(data: dict) -> bool:
 
         return True
     except Exception as e:
-        logger.error(f"❌ process_max_data exception: {e}")
+        logger.error(f"❌ process_max_message exception: {e}")
         return False
 
 # ===================================================================
-# WEB SERVER
+# POLLING ЦИКЛ
 # ===================================================================
-async def webhook_handler(request: web.Request) -> web.Response:
-    try:
-        # Проверка секретного ключа
-        secret = request.headers.get("X-Max-Signature", "")
-        if secret != MAX_WEBHOOK_SECRET:
-            logger.warning(f"⚠️ Неверный секрет вебхука: {secret}")
-            return web.json_response({"ok": False, "error": "Unauthorized"}, status=401)
+async def polling_loop():
+    """Основной цикл опроса Max API"""
+    global last_message_id
+    logger.info("🔄 Запуск polling цикла...")
+    
+    while True:
+        try:
+            # Получаем последние сообщения
+            messages = await max_client.get_messages(limit=5)
+            
+            if messages:
+                # Берём самое новое сообщение
+                latest_message = messages[0]
+                current_id = latest_message.get("id")
+                
+                # Если это новое сообщение (не то, что уже обработали)
+                if current_id != last_message_id:
+                    logger.info(f"🆕 Новое сообщение detected: #{current_id}")
+                    await process_max_message(latest_message)
+                    last_message_id = current_id
+                else:
+                    logger.debug("🔄 Новых сообщений нет")
+            
+            # Ждём перед следующим опросом
+            await asyncio.sleep(POLL_INTERVAL)
+            
+        except Exception as e:
+            logger.error(f"❌ polling_loop error: {e}")
+            await asyncio.sleep(POLL_INTERVAL)
 
-        data = await request.json()
-        logger.info(f"🔔 Webhook от Max: {json.dumps(data, ensure_ascii=False)[:200]}")
+# ===================================================================
+# HEALTH CHECK
+# ===================================================================
+async def health_handler(request):
+    return web.json_response({
+        "status": "ok",
+        "service": "max-to-telegram-bot",
+        "mode": "polling",
+        "last_message_id": last_message_id
+    })
 
-        # Проверка канала
-        if str(data.get("channel_id")) != str(MAX_CHANNEL_ID):
-            logger.warning(f"⚠️ Сообщение из другого канала: {data.get('channel_id')}")
-            return web.json_response({"ok": False, "error": "Wrong channel"})
-
-        success = await process_max_data(data)
-        return web.json_response({"ok": success})
-
-    except json.JSONDecodeError:
-        return web.json_response({"ok": False, "error": "Invalid JSON"}, status=400)
-    except Exception as e:
-        logger.error(f"❌ webhook_handler exception: {e}")
-        return web.json_response({"ok": False, "error": str(e)}, status=500)
-
-async def health_handler(request: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "service": "max-to-telegram-bot"})
-
+# ===================================================================
+# ОЧИСТКА
+# ===================================================================
 async def cleanup(app):
     logger.info("🧹 Закрытие сессий...")
     if session and not session.closed:
         await session.close()
 
+# ===================================================================
+# СОЗДАНИЕ WEB APP
+# ===================================================================
 def create_app():
     app = web.Application()
     app.router.add_get('/health', health_handler)
-    app.router.add_post('/webhook', webhook_handler)
+    app.on_startup.append(lambda app: logger.info("🚀 Приложение запущено"))
     app.on_shutdown.append(cleanup)
     return app
 
@@ -307,10 +346,27 @@ def create_app():
 # ===================================================================
 if __name__ == '__main__':
     try:
-        logger.info("🚀 Запуск сервера на порту 8080...")
-        web.run_app(create_app(), host='0.0.0.0', port=8080)
+        logger.info("🚀 Запуск polling сервера на порту 8080...")
+        
+        # Запускаем веб-сервер и polling параллельно
+        async def run_polling():
+            await polling_loop()
+        
+        app = create_app()
+        
+        # Запускаем веб-сервер
+        runner = web.AppRunner(app)
+        asyncio.get_event_loop().run_until_complete(runner.setup())
+        site = web.TCPSite(runner, '0.0.0.0', 8080)
+        asyncio.get_event_loop().run_until_complete(site.start())
+        
+        logger.info("✅ Веб-сервер запущен на http://0.0.0.0:8080")
+        
+        # Запускаем polling
+        asyncio.get_event_loop().run_until_complete(run_polling())
+        
     except KeyboardInterrupt:
-        logger.info("🛑 Остановка...")
+        logger.info("🛑 Остановка по сигналу...")
     except Exception as e:
         logger.exception(f"❌ Критическая ошибка: {e}")
         sys.exit(1)
