@@ -3,9 +3,3 @@ __pycache__/
 *.log
 .env
 bot_debug.log
-*.pyo
-*.pyd
-.Python
-env/
-venv/
-*.so
