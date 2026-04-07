@@ -6,14 +6,14 @@ import logging
 import aiohttp
 import json
 from aiohttp import web
-from typing import Optional, List, Dict
+from typing import List, Dict, Optional
 
 # ===================================================================
-# НАСТРОЙКА ЛОГИРОВАНИЯ
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (ВСЁ ТОЛЬКО В ЛОГИ)
 # ===================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler('bot_debug.log', encoding='utf-8', mode='a')
@@ -22,292 +22,256 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# 2. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ===================================================================
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHANNEL_ID = os.getenv('MAX_CHANNEL_ID', '').strip()
+MAX_API_BASE = os.getenv('MAX_API_BASE_URL', 'https://platform-api.max.ru')
 POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '3'))
 
-logger.info("=" * 80)
-logger.info("🚀 ЗАПУСК БОТА-ПЕРЕСЫЛЬЩИКА (MAX -> TELEGRAM) [POLLING]")
-logger.info(f"📢 MAX Channel: {MAX_CHANNEL_ID}")
-logger.info(f"👥 TG Chat: {TELEGRAM_CHAT_ID}")
-logger.info(f"⏱️ Poll Interval: {POLL_INTERVAL} sec")
-logger.info("=" * 80)
+# Глобальное состояние
+LAST_MSG_ID: Optional[str] = None
 
-# 🔹 ПРОВЕРКА ПЕРЕМЕННЫХ
-missing = []
-if not TELEGRAM_BOT_TOKEN:
-    missing.append('TELEGRAM_BOT_TOKEN')
-if not TELEGRAM_CHAT_ID:
-    missing.append('TELEGRAM_CHAT_ID')
-if not MAX_TOKEN:
-    missing.append('MAX_TOKEN')
-if not MAX_CHANNEL_ID:
-    missing.append('MAX_CHANNEL_ID')
+logger.info("=" * 70)
+logger.info("🚀 MAX -> TELEGRAM FORWARDER (POLLING MODE)")
+logger.info(f"📡 MAX Channel : {MAX_CHANNEL_ID}")
+logger.info(f"📥 TG Chat     : {TELEGRAM_CHAT_ID}")
+logger.info(f"⏱  Poll Interval: {POLL_INTERVAL} sec")
+logger.info("📜 ОТВЕТЫ В MAX: ОТКЛЮЧЕНЫ (только логи)")
+logger.info("=" * 70)
 
+# Валидация
+required = {
+    'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN,
+    'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
+    'MAX_TOKEN': MAX_TOKEN,
+    'MAX_CHANNEL_ID': MAX_CHANNEL_ID
+}
+missing = [k for k, v in required.items() if not v]
 if missing:
-    logger.error("❌ ОТСУТСТВУЮТ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ:")
-    for var in missing:
-        logger.error(f"   - {var}")
-    raise ValueError(f"Missing: {', '.join(missing)}")
-
-logger.info("✅ Все переменные установлены")
-logger.info("=" * 80)
+    logger.critical(f"❌ Отсутствуют переменные: {', '.join(missing)}")
+    sys.exit(1)
+logger.info("✅ Переменные окружения проверены")
 
 # ===================================================================
-# СЕССИЯ
+# 3. TELEGRAM CLIENT (ОТПРАВКА)
 # ===================================================================
-session: Optional[aiohttp.ClientSession] = None
-last_message_id: Optional[str] = None
-
-async def get_session() -> aiohttp.ClientSession:
-    global session
-    if session is None or session.closed:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
-    return session
-
-# ===================================================================
-# TELEGRAM CLIENT
-# ===================================================================
-class TelegramClient:
-    def __init__(self, token: str):
+class TelegramSender:
+    def __init__(self, token: str, chat_id: str):
         self.token = token
-        self.api_url = f"https://api.telegram.org/bot{token}"
+        self.chat_id = chat_id
+        self.base = f"https://api.telegram.org/bot{token}"
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.LIMIT_BYTES = 50 * 1024 * 1024  # 50 МБ
+        self.LIMIT_CAPTION = 1024            # Лимит подписи Telegram
 
-    async def send_message(self, chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
+    async def init(self):
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
+
+    async def _post(self, endpoint: str, **kwargs) -> bool:
+        await self.init()
+        url = f"{self.base}/{endpoint}"
         try:
-            sess = await get_session()
-            data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
-            async with sess.post(f"{self.api_url}/sendMessage", json=data) as resp:
+            async with self.session.post(url, **kwargs) as resp:
                 if resp.status == 200:
-                    logger.info("✅ Сообщение отправлено в Telegram")
                     return True
+                err_text = await resp.text()
+                logger.error(f"❌ TG API Error ({endpoint}): {resp.status} | {err_text[:300]}")
                 return False
         except Exception as e:
-            logger.error(f"❌ send_message: {e}")
+            logger.error(f"❌ Исключение при отправке в TG: {e}")
             return False
 
-    async def send_photo(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
-        try:
-            if len(file_bytes) > 50 * 1024 * 1024:
-                return False
-            sess = await get_session()
-            data = aiohttp.FormData()
-            data.add_field("chat_id", chat_id)
-            data.add_field("photo", file_bytes, filename="photo.jpg")
-            if caption:
-                data.add_field("caption", caption)
-                data.add_field("parse_mode", "HTML")
-            async with sess.post(f"{self.api_url}/sendPhoto", data=data) as resp:
-                return resp.status == 200
-        except Exception as e:
-            logger.error(f"❌ send_photo: {e}")
+    async def send_text(self, text: str) -> bool:
+        if not text: return True
+        return await self._post("sendMessage", json={
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        })
+
+    async def send_media(self, file_bytes: bytes, media_type: str, filename: str, caption: str = "") -> bool:
+        if len(file_bytes) > self.LIMIT_BYTES:
+            logger.warning(f"⚠️ Пропуск файла >50МБ: {filename} ({len(file_bytes)/1024/1024:.2f} МБ)")
             return False
 
-    async def send_video(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
-        try:
-            if len(file_bytes) > 50 * 1024 * 1024:
-                return False
-            sess = await get_session()
-            data = aiohttp.FormData()
-            data.add_field("chat_id", chat_id)
-            data.add_field("video", file_bytes, filename="video.mp4")
-            if caption:
-                data.add_field("caption", caption)
-                data.add_field("parse_mode", "HTML")
-            async with sess.post(f"{self.api_url}/sendVideo", data=data) as resp:
-                return resp.status == 200
-        except Exception as e:
-            logger.error(f"❌ send_video: {e}")
-            return False
+        await self.init()
+        data = aiohttp.FormData()
+        data.add_field("chat_id", self.chat_id)
+        data.add_field(media_type.lower(), file_bytes, filename=filename)
+        
+        if caption:
+            # Telegram обрезает подписи длиннее 1024 символов
+            safe_caption = caption[:self.LIMIT_CAPTION]
+            data.add_field("caption", safe_caption)
+            data.add_field("parse_mode", "HTML")
 
-    async def send_document(self, chat_id: str, file_bytes: bytes, filename: str, caption: str = "") -> bool:
-        try:
-            if len(file_bytes) > 50 * 1024 * 1024:
-                return False
-            sess = await get_session()
-            data = aiohttp.FormData()
-            data.add_field("chat_id", chat_id)
-            data.add_field("document", file_bytes, filename=filename)
-            if caption:
-                data.add_field("caption", caption)
-                data.add_field("parse_mode", "HTML")
-            async with sess.post(f"{self.api_url}/sendDocument", data=data) as resp:
-                return resp.status == 200
-        except Exception as e:
-            logger.error(f"❌ send_document: {e}")
-            return False
+        return await self._post(f"send{media_type.capitalize()}", data=data)
 
 # ===================================================================
-# MAX CLIENT (POLLING)
+# 4. MAX CLIENT (ПОЛУЧЕНИЕ)
 # ===================================================================
-class MaxClient:
-    def __init__(self, token: str, channel_id: str):
+class MaxFetcher:
+    def __init__(self, token: str, channel_id: str, base_url: str):
         self.token = token
         self.channel_id = channel_id
-        self.base_url = "https://platform-api.max.ru"
+        self.base = base_url
+        self.session: Optional[aiohttp.ClientSession] = None
 
-    async def get_messages(self, limit: int = 5) -> Optional[List[Dict]]:
+    async def init(self):
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+
+    async def get_latest_messages(self, limit: int = 5) -> List[Dict]:
+        await self.init()
+        # ⚠️ ВАЖНО: Путь может отличаться в зависимости от версии API MAX
+        url = f"{self.base}/channels/{self.channel_id}/messages"
+        headers = {"Authorization": self.token}
+        
         try:
-            sess = await get_session()
-            # ⚠️ АДАПТИРУЙТЕ ЭНДПОИНТ ПОД РЕАЛЬНОЕ API MAX
-            async with sess.get(
-                f"{self.base_url}/channels/{self.channel_id}/messages",
-                headers={"Authorization": self.token},
-                params={"limit": limit}
-            ) as resp:
+            async with self.session.get(url, headers=headers, params={"limit": limit}) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    # ⚠️ АДАПТИРУЙТЕ ПОЛЯ ПОД ОТВЕТ API MAX
-                    return data.get('messages', []) if isinstance(data, dict) else data
-                return None
+                    raw = await resp.json()
+                    # Нормализация ответа (список или объект с ключом messages)
+                    if isinstance(raw, list): return raw
+                    if isinstance(raw, dict) and "messages" in raw: return raw["messages"]
+                    return []
+                logger.error(f"❌ MAX API Error (get messages): {resp.status}")
+                return []
         except Exception as e:
-            logger.error(f"❌ get_messages: {e}")
-            return None
+            logger.error(f"❌ Ошибка запроса к MAX: {e}")
+            return []
 
     async def download_file(self, file_token: str) -> Optional[bytes]:
+        await self.init()
+        # ⚠️ ВАЖНО: Путь может отличаться
+        url = f"{self.base}/files/{file_token}/download"
+        headers = {"Authorization": self.token}
+        
         try:
-            sess = await get_session()
-            # ⚠️ АДАПТИРУЙТЕ ЭНДПОИНТ ПОД РЕАЛЬНОЕ API MAX
-            async with sess.get(
-                f"{self.base_url}/files/{file_token}/download",
-                headers={"Authorization": self.token}
-            ) as resp:
+            async with self.session.get(url, headers=headers) as resp:
                 if resp.status == 200:
                     return await resp.read()
+                logger.warning(f"⚠️ Не удалось скачать файл {file_token}: HTTP {resp.status}")
                 return None
         except Exception as e:
-            logger.error(f"❌ download_file: {e}")
+            logger.error(f"❌ Ошибка скачивания файла: {e}")
             return None
 
 # ===================================================================
-# ОБРАБОТКА СООБЩЕНИЯ
+# 5. ОБРАБОТЧИК СООБЩЕНИЙ
 # ===================================================================
-tg_client = TelegramClient(TELEGRAM_BOT_TOKEN)
-max_client = MaxClient(MAX_TOKEN, MAX_CHANNEL_ID)
+tg = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+max_api = MaxFetcher(MAX_TOKEN, MAX_CHANNEL_ID, MAX_API_BASE)
 
-async def process_message(msg: Dict) -> bool:
-    try:
-        text = msg.get("text", "")
-        attachments = msg.get("attachments", [])
-        msg_format = msg.get("format", "HTML")
-        msg_id = msg.get("id", "unknown")
+async def process_message(msg: Dict):
+    global LAST_MSG_ID
+    msg_id = str(msg.get("id", ""))
+    
+    # Защита от повторов
+    if msg_id == LAST_MSG_ID:
+        return
+
+    text = msg.get("text", "")
+    attachments = msg.get("attachments", [])
+    logger.info(f"🆕 Новое сообщение ID:{msg_id} | Текст:{len(text)}симв | Файлов:{len(attachments)}")
+
+    # 1. Отправка текста
+    if text:
+        await tg.send_text(text)
+
+    # 2. Отправка вложений
+    for att in attachments:
+        att_type = att.get("type", "file").lower()
+        token = att.get("token")
+        filename = att.get("name", "attachment.dat")
         
-        logger.info(f"📨 Обработка сообщения #{msg_id}")
+        if not token:
+            logger.warning("⚠️ Вложение без токена, пропуск")
+            continue
 
-        if text:
-            await tg_client.send_message(TELEGRAM_CHAT_ID, text, parse_mode=msg_format)
-        
-        for att in attachments:
-            att_type = att.get("type", "")
-            caption = text[:1000] if text else ""
-            file_bytes = None
-            filename = "file"
+        logger.info(f"📥 Скачиваю: {filename}")
+        file_data = await max_api.download_file(token)
+        if not file_data:
+            continue
 
-            if "token" in att:
-                file_bytes = await max_client.download_file(att["token"])
-                filename = att.get("name", "file")
-            elif "url" in att:
-                sess = await get_session()
-                async with sess.get(att["url"]) as resp:
-                    if resp.status == 200:
-                        file_bytes = await resp.read()
-                        filename = att.get("name", att["url"].split("/")[-1])
-            
-            if not file_bytes:
-                continue
+        # Маппинг типов MAX -> Telegram API
+        tg_type = "Document"
+        if att_type in ("image", "photo"): tg_type = "Photo"
+        elif att_type == "video": tg_type = "Video"
+        elif att_type == "audio": tg_type = "Audio"
+        elif att_type == "voice": tg_type = "Voice"
+        # Файлы с расширениями видео/аудио, пришедшие как "file"
+        elif att_type == "file":
+            ext = filename.split('.')[-1].lower() if '.' in filename else ''
+            if ext in ('mp4', 'mov', 'avi', 'mkv'): tg_type = "Video"
+            elif ext in ('mp3', 'wav', 'ogg', 'm4a'): tg_type = "Audio"
 
-            if att_type == "image":
-                await tg_client.send_photo(TELEGRAM_CHAT_ID, file_bytes, caption)
-            elif att_type == "video":
-                await tg_client.send_video(TELEGRAM_CHAT_ID, file_bytes, caption)
-            elif att_type in ["audio", "file"]:
-                await tg_client.send_document(TELEGRAM_CHAT_ID, file_bytes, filename, caption)
-            
-            await asyncio.sleep(0.5)
+        await tg.send_media(file_data, tg_type, filename, caption=text if tg_type != "Document" else "")
 
-        return True
-    except Exception as e:
-        logger.error(f"❌ process_message: {e}")
-        return False
+    LAST_MSG_ID = msg_id
+    logger.info(f"✅ Сообщение {msg_id} полностью обработано")
 
 # ===================================================================
-# POLLING ЦИКЛ
+# 6. POLLING LOOP + ИНИЦИАЛИЗАЦИЯ
 # ===================================================================
 async def polling_loop():
-    global last_message_id
-    logger.info("🔄 Запуск polling цикла...")
+    global LAST_MSG_ID
+    logger.info("🔄 Запуск цикла опроса...")
     
+    # Синхронизация при старте: запоминаем ID самого свежего сообщения, чтобы не спамить старыми
+    logger.info("⏳ Синхронизация с MAX (пропуск старых сообщений)...")
+    init_msgs = await max_api.get_latest_messages(limit=1)
+    if init_msgs:
+        LAST_MSG_ID = str(init_msgs[0].get("id", ""))
+        logger.info(f"📍 Стартовый ID зафиксирован: {LAST_MSG_ID}")
+    else:
+        logger.warning("⚠️ Не удалось получить начальный ID. Будут обработаны все новые.")
+
     while True:
         try:
-            messages = await max_client.get_messages(limit=5)
-            
-            if messages and isinstance(messages, list) and len(messages) > 0:
-                latest = messages[0]
-                current_id = str(latest.get("id", ""))
-                
-                if current_id and current_id != last_message_id:
-                    logger.info(f"🆕 Новое сообщение: #{current_id}")
-                    await process_message(latest)
-                    last_message_id = current_id
-            
-            await asyncio.sleep(POLL_INTERVAL)
-            
+            messages = await max_api.get_latest_messages(limit=1)
+            if messages:
+                await process_message(messages[0])
         except Exception as e:
-            logger.error(f"❌ polling_loop: {e}")
-            await asyncio.sleep(POLL_INTERVAL)
+            logger.error(f"❌ Критическая ошибка в цикле: {e}")
+        
+        await asyncio.sleep(POLL_INTERVAL)
 
 # ===================================================================
-# HEALTH CHECK
+# 7. WEB SERVER (ЗДОРОВЬЕ ДЛЯ RENDER/UPTIMEROBOT)
 # ===================================================================
 async def health_handler(request):
     return web.json_response({
         "status": "ok",
-        "service": "max-to-telegram-bot",
-        "mode": "polling",
-        "last_id": last_message_id
+        "service": "max-to-telegram-forwarder",
+        "last_processed_id": LAST_MSG_ID,
+        "mode": "polling_logs_only"
     })
 
-# ===================================================================
-# ОЧИСТКА
-# ===================================================================
-async def cleanup(app):
-    logger.info("🧹 Закрытие сессий...")
-    if session and not session.closed:
-        await session.close()
+app = web.Application()
+app.router.add_get('/health', health_handler)
 
 # ===================================================================
-# СОЗДАНИЕ ПРИЛОЖЕНИЯ
+# 8. ГЛАВНЫЙ ЗАПУСК
 # ===================================================================
-def create_app():
-    app = web.Application()
-    app.router.add_get('/health', health_handler)
-    app.on_shutdown.append(cleanup)
-    return app
+async def main():
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    await site.start()
+    logger.info("🌐 Веб-сервер запущен на :8080 (для UptimeRobot)")
+    
+    await polling_loop()
 
-# ===================================================================
-# ЗАПУСК
-# ===================================================================
 if __name__ == '__main__':
     try:
-        logger.info("🚀 Запуск polling сервера на порту 8080...")
-        
-        async def run():
-            app = create_app()
-            runner = web.AppRunner(app)
-            await runner.setup()
-            site = web.TCPSite(runner, '0.0.0.0', 8080)
-            await site.start()
-            logger.info("✅ Веб-сервер запущен")
-            await polling_loop()
-        
-        asyncio.run(run())
-        
+        asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Остановка...")
+        logger.info(" Остановка по сигналу...")
     except Exception as e:
-        logger.exception(f"❌ Критическая ошибка: {e}")
+        logger.exception(f"💥 Фатальный сбой: {e}")
         sys.exit(1)
