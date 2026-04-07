@@ -6,13 +6,13 @@ import logging
 import aiohttp
 import json
 from aiohttp import web
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
+# 1. ЛОГИРОВАНИЕ
 # ===================================================================
 logging.basicConfig(
-    level=logging.DEBUG if os.getenv('LOG_LEVEL') == 'DEBUG' else logging.INFO,
+    level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -42,7 +42,7 @@ logger.info(f"⏱  Poll Interval: {POLL_INTERVAL} sec")
 logger.info("📜 ОТВЕТЫ В MAX: ОТКЛЮЧЕНЫ (только логи)")
 logger.info("=" * 70)
 
-# Проверка обязательных переменных
+# Проверка переменных
 required = {
     'TELEGRAM_BOT_TOKEN': TELEGRAM_BOT_TOKEN,
     'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
@@ -56,7 +56,7 @@ if missing:
 logger.info("✅ Переменные окружения проверены")
 
 # ===================================================================
-# 3. TELEGRAM CLIENT (ОТПРАВКА)
+# 3. TELEGRAM SENDER
 # ===================================================================
 class TelegramSender:
     def __init__(self, token: str, chat_id: str):
@@ -78,20 +78,17 @@ class TelegramSender:
             async with self.session.post(url, **kwargs) as resp:
                 if resp.status == 200:
                     return True
-                err_text = await resp.text()
-                logger.error(f"❌ TG API Error ({endpoint}): {resp.status} | {err_text[:300]}")
+                err = await resp.text()
+                logger.error(f"❌ TG Error ({endpoint}): {resp.status} | {err[:300]}")
                 return False
         except Exception as e:
             logger.error(f"❌ TG Exception: {e}")
             return False
 
     async def send_text(self, text: str) -> bool:
-        if not text:
-            return True
+        if not text: return True
         return await self._post("sendMessage", json={
-            "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": "HTML"
+            "chat_id": self.chat_id, "text": text, "parse_mode": "HTML"
         })
 
     async def send_media(self, file_bytes: bytes, media_type: str, filename: str, caption: str = "") -> bool:
@@ -103,13 +100,12 @@ class TelegramSender:
         data.add_field("chat_id", self.chat_id)
         data.add_field(media_type.lower(), file_bytes, filename=filename)
         if caption:
-            safe_caption = caption[:self.LIMIT_CAPTION]
-            data.add_field("caption", safe_caption)
+            data.add_field("caption", caption[:self.LIMIT_CAPTION])
             data.add_field("parse_mode", "HTML")
         return await self._post(f"send{media_type.capitalize()}", data=data)
 
 # ===================================================================
-# 4. MAX CLIENT (POLLING)
+# 4. MAX FETCHER (POLLING)
 # ===================================================================
 class MaxFetcher:
     def __init__(self, token: str, channel_id: str, base: str):
@@ -127,33 +123,22 @@ class MaxFetcher:
         url = f"{self.base}/messages"
         headers = {"Authorization": self.token}
         params = {"chat_id": self.channel_id, "limit": limit}
-        
-        logger.debug(f"🔍 Запрос к MAX: GET {url}?chat_id={self.channel_id}")
-        
         try:
             async with self.session.get(url, headers=headers, params=params) as resp:
-                logger.debug(f"📡 Ответ MAX: {resp.status}")
                 if resp.status == 200:
                     raw = await resp.json()
-                    logger.debug(f"📦 RAW: {json.dumps(raw, ensure_ascii=False)[:500]}")
                     messages = []
-                    if isinstance(raw, list):
-                        messages = raw
+                    if isinstance(raw, list): messages = raw
                     elif isinstance(raw, dict):
                         for key in ['messages', 'items', 'data', 'result', 'message']:
                             if key in raw:
                                 val = raw[key]
-                                if isinstance(val, list):
-                                    messages = val
-                                    break
-                                elif isinstance(val, dict):
-                                    messages = [val]
-                                    break
+                                if isinstance(val, list): messages = val; break
+                                elif isinstance(val, dict): messages = [val]; break
                     return messages
-                logger.error(f"❌ MAX API Error: {resp.status}")
                 return []
         except Exception as e:
-            logger.error(f"❌ Ошибка запроса к MAX: {e}")
+            logger.error(f"❌ MAX Error: {e}")
             return []
 
     async def download_file(self, file_token: str) -> Optional[bytes]:
@@ -166,19 +151,17 @@ class MaxFetcher:
                     return await resp.read()
                 return None
         except Exception as e:
-            logger.error(f"❌ Ошибка скачивания: {e}")
+            logger.error(f"❌ Download Error: {e}")
             return None
 
 # ===================================================================
 # 5. ОБРАБОТКА СООБЩЕНИЙ
 # ===================================================================
-tg_sender = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-max_fetcher = MaxFetcher(MAX_TOKEN, MAX_CHANNEL_ID, MAX_API_BASE)
+tg = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+max_api = MaxFetcher(MAX_TOKEN, MAX_CHANNEL_ID, MAX_API_BASE)
 
 async def process_message(msg: Dict):
     global LAST_MSG_ID
-    
-    logger.debug(f"🔍 RAW: {json.dumps(msg, ensure_ascii=False)[:500]}")
     
     # Извлекаем ID (пробуем разные имена полей)
     msg_id = str(
@@ -213,38 +196,30 @@ async def process_message(msg: Dict):
 
     # Отправка текста
     if text:
-        await tg_sender.send_text(text)
+        await tg.send_text(text)
 
     # Отправка вложений
     for att in attachments:
-        if not isinstance(att, dict):
-            continue
+        if not isinstance(att, dict): continue
         att_type = str(att.get("type") or att.get("media_type") or "file").lower()
         token = att.get("token") or att.get("file_token") or att.get("id")
         filename = att.get("name") or att.get("filename") or att.get("file_name") or "file.dat"
-        if not token:
-            continue
+        if not token: continue
         logger.info(f"📥 Скачиваю: {filename}")
-        file_data = await max_fetcher.download_file(token)
-        if not file_data:
-            continue
-        # Маппинг типов
+        file_data = await max_api.download_file(token)
+        if not file_data: continue
+        
         tg_type = "Document"
-        if att_type in ("image", "photo"):
-            tg_type = "Photo"
-        elif att_type == "video":
-            tg_type = "Video"
-        elif att_type == "audio":
-            tg_type = "Audio"
-        elif att_type == "voice":
-            tg_type = "Voice"
+        if att_type in ("image", "photo"): tg_type = "Photo"
+        elif att_type == "video": tg_type = "Video"
+        elif att_type == "audio": tg_type = "Audio"
+        elif att_type == "voice": tg_type = "Voice"
         elif att_type == "file":
             ext = filename.split('.')[-1].lower() if '.' in filename else ''
-            if ext in ('mp4', 'mov', 'avi', 'mkv', 'webm'):
-                tg_type = "Video"
-            elif ext in ('mp3', 'wav', 'ogg', 'm4a'):
-                tg_type = "Audio"
-        await tg_sender.send_media(file_data, tg_type, filename, caption=text if tg_type != "Document" else "")
+            if ext in ('mp4', 'mov', 'avi', 'mkv', 'webm'): tg_type = "Video"
+            elif ext in ('mp3', 'wav', 'ogg', 'm4a'): tg_type = "Audio"
+        
+        await tg.send_media(file_data, tg_type, filename, caption=text if tg_type != "Document" else "")
         await asyncio.sleep(0.5)
 
     LAST_MSG_ID = msg_id
@@ -256,17 +231,14 @@ async def process_message(msg: Dict):
 async def polling_loop():
     global LAST_MSG_ID
     logger.info("🔄 Запуск цикла опроса...")
-    # Синхронизация при старте
-    init_msgs = await max_fetcher.get_latest_messages(limit=1)
+    init_msgs = await max_api.get_latest_messages(limit=1)
     if init_msgs:
         first = init_msgs[0]
-        LAST_MSG_ID = str(
-            first.get("id") or first.get("message_id") or first.get("_id") or ""
-        ).strip()
+        LAST_MSG_ID = str(first.get("id") or first.get("message_id") or first.get("_id") or "").strip()
         logger.info(f"📍 Стартовый ID: {LAST_MSG_ID}")
     while True:
         try:
-            messages = await max_fetcher.get_latest_messages(limit=1)
+            messages = await max_api.get_latest_messages(limit=1)
             if messages:
                 await process_message(messages[0])
         except Exception as e:
@@ -277,11 +249,7 @@ async def polling_loop():
 # 7. WEB SERVER (HEALTH CHECK)
 # ===================================================================
 async def health_handler(request):
-    return web.json_response({
-        "status": "ok",
-        "service": "max-to-telegram",
-        "last_id": LAST_MSG_ID
-    })
+    return web.json_response({"status": "ok", "service": "max-to-telegram", "last_id": LAST_MSG_ID})
 
 app = web.Application()
 app.router.add_get('/health', health_handler)
