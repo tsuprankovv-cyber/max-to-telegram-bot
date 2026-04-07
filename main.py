@@ -6,13 +6,13 @@ import logging
 import aiohttp
 import json
 from aiohttp import web
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 # ===================================================================
-# 1. ЛОГИРОВАНИЕ (ВСЁ ТОЛЬКО В ЛОГИ — НИКАКИХ ОТВЕТОВ В MAX)
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
 # ===================================================================
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if os.getenv('LOG_LEVEL') == 'DEBUG' else logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
@@ -131,7 +131,7 @@ class MaxFetcher:
         """Получение последних сообщений из канала MAX"""
         await self.init()
         
-        # 🔹 Эндпоинт: /messages?chat_id={channel_id} (логичное расширение документации)
+        # 🔹 Эндпоинт: /messages?chat_id={channel_id}
         url = f"{self.base}/messages"
         headers = {"Authorization": self.token}
         params = {"chat_id": self.channel_id, "limit": limit}
@@ -144,20 +144,23 @@ class MaxFetcher:
                 
                 if resp.status == 200:
                     raw = await resp.json()
-                    logger.debug(f"📦 Ответ: {str(raw)[:300]}...")
+                    logger.debug(f"📦 RAW ответ MAX: {json.dumps(raw, ensure_ascii=False)[:500]}")
                     
-                    # Нормализация ответа: список или объект с ключом
+                    # Нормализация: список или объект с ключом
+                    messages = []
                     if isinstance(raw, list):
-                        return raw
-                    if isinstance(raw, dict):
+                        messages = raw
+                    elif isinstance(raw, dict):
                         for key in ['messages', 'items', 'data', 'result', 'message']:
                             if key in raw:
                                 val = raw[key]
                                 if isinstance(val, list):
-                                    return val
-                                if isinstance(val, dict):
-                                    return [val]
-                    return []
+                                    messages = val
+                                    break
+                                elif isinstance(val, dict):
+                                    messages = [val]
+                                    break
+                    return messages
                     
                 logger.error(f"❌ MAX API Error: {resp.status} | URL: {url}?chat_id={self.channel_id}")
                 return []
@@ -170,7 +173,6 @@ class MaxFetcher:
         """Скачивание файла из MAX по токену"""
         await self.init()
         
-        # 🔹 Эндпоинт для скачивания (предположительный)
         url = f"{self.base}/files/{file_token}/download"
         headers = {"Authorization": self.token}
         
@@ -187,98 +189,131 @@ class MaxFetcher:
             return None
 
 # ===================================================================
-# 5. ОБРАБОТКА СООБЩЕНИЙ
+# 5. ОБРАБОТКА СООБЩЕНИЙ (С ПОДДЕРЖКОЙ РАЗНЫХ ФОРМАТОВ ПОЛЕЙ)
 # ===================================================================
 tg_sender = TelegramSender(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 max_fetcher = MaxFetcher(MAX_TOKEN, MAX_CHANNEL_ID, MAX_API_BASE)
 
 async def process_message(msg: Dict):
-    """Обработка одного сообщения из MAX и отправка в Telegram"""
+    """Обработка сообщения из MAX с поддержкой разных форматов полей"""
     global LAST_MSG_ID
     
-    msg_id = str(msg.get("id", ""))
+    # 🔹 ЛОГИРУЕМ ВСЮ СТРУКТУРУ (для отладки)
+    logger.debug(f"🔍 RAW сообщение от MAX: {json.dumps(msg, ensure_ascii=False)[:500]}")
     
-    # Защита от дублей
-    if msg_id == LAST_MSG_ID:
-        logger.debug(f"⏭ Сообщение {msg_id} уже обработано, пропускаю")
+    # 🔹 ПРОБУЕМ РАЗНЫЕ ИМЕНА ПОЛЕЙ ДЛЯ ID
+    msg_id = str(
+        msg.get("id") or 
+        msg.get("message_id") or 
+        msg.get("_id") or 
+        msg.get("msgId") or 
+        msg.get("uid") or 
+        msg.get("messageId") or 
+        ""
+    )
+    
+    # 🔹 ПРОБУЕМ РАЗНЫЕ ИМЕНА ПОЛЕЙ ДЛЯ ТЕКСТА
+    text = (
+        msg.get("text") or 
+        msg.get("content") or 
+        msg.get("body") or 
+        msg.get("message") or 
+        (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None) or 
+        ""
+    )
+    
+    # 🔹 ПРОБУЕМ РАЗНЫЕ ИМЕНА ПОЛЕЙ ДЛЯ ВЛОЖЕНИЙ
+    attachments = (
+        msg.get("attachments") or 
+        msg.get("files") or 
+        msg.get("media") or 
+        (msg.get("payload", {}).get("attachments") if isinstance(msg.get("payload"), dict) else []) or 
+        (msg.get("payload", {}).get("files") if isinstance(msg.get("payload"), dict) else []) or 
+        []
+    )
+    
+    logger.info(f"🆕 Сообщение | ID:'{msg_id}' | Текст:{len(text)}симв | Файлов:{len(attachments)}")
+    
+    # Если всё ещё пусто — логируем и выходим
+    if not msg_id and not text and not attachments:
+        logger.warning("⚠️ Пустое сообщение — пропускаю (проверьте структуру ответа MAX)")
         return
 
-    text = msg.get("text", "")
-    attachments = msg.get("attachments", [])
-    
-    logger.info(f"🆕 Новое сообщение из MAX | ID:{msg_id} | Текст:{len(text)}симв | Файлов:{len(attachments)}")
+    # Защита от дублей
+    if msg_id and msg_id == LAST_MSG_ID:
+        logger.debug(f"⏭ Сообщение {msg_id} уже обработано")
+        return
 
-    # 1. Отправка текста (если есть)
+    # 1. Отправка текста
     if text:
         await tg_sender.send_text(text)
 
     # 2. Отправка вложений
     for att in attachments:
-        att_type = att.get("type", "file").lower()
-        token = att.get("token")
-        filename = att.get("name", "attachment.dat")
-        
+        if not isinstance(att, dict):
+            continue
+            
+        # 🔹 Поддержка разных структур вложений
+        att_type = str(att.get("type") or att.get("media_type") or "file").lower()
+        token = att.get("token") or att.get("file_token") or att.get("id")
+        filename = att.get("name") or att.get("filename") or att.get("file_name") or "file.dat"
+            
         if not token:
-            logger.warning("⚠️ Вложение без токена, пропуск")
+            logger.warning(f"⚠️ Вложение без токена: {att}")
             continue
 
-        logger.info(f"📥 Скачиваю файл: {filename}")
+        logger.info(f"📥 Скачиваю: {filename}")
         file_data = await max_fetcher.download_file(token)
-        
         if not file_data:
-            logger.error(f"❌ Не удалось скачать файл: {filename}")
             continue
 
-        # Маппинг типов MAX → типы Telegram API
+        # Маппинг типов
         tg_type = "Document"
-        if att_type in ("image", "photo"):
+        if att_type in ("image", "photo"): 
             tg_type = "Photo"
-        elif att_type == "video":
+        elif att_type == "video": 
             tg_type = "Video"
-        elif att_type == "audio":
+        elif att_type == "audio": 
             tg_type = "Audio"
-        elif att_type == "voice":
+        elif att_type == "voice": 
             tg_type = "Voice"
         elif att_type == "file":
-            # Определяем тип по расширению
             ext = filename.split('.')[-1].lower() if '.' in filename else ''
-            if ext in ('mp4', 'mov', 'avi', 'mkv', 'webm'):
+            if ext in ('mp4', 'mov', 'avi', 'mkv', 'webm'): 
                 tg_type = "Video"
-            elif ext in ('mp3', 'wav', 'ogg', 'm4a', 'flac'):
+            elif ext in ('mp3', 'wav', 'ogg', 'm4a'): 
                 tg_type = "Audio"
 
-        # Отправка в Telegram
-        await tg_sender.send_media(
-            file_data, 
-            tg_type, 
-            filename, 
-            caption=text if tg_type != "Document" else ""
-        )
-        
-        # Пауза между файлами, чтобы не получить лимит 429
-        await asyncio.sleep(0.5)
+        await tg_sender.send_media(file_data, tg_type, filename, caption=text if tg_type != "Document" else "")
+        await asyncio.sleep(0.5)  # Пауза между файлами
 
-    # Обновляем ID последнего обработанного сообщения
-    LAST_MSG_ID = msg_id
-    logger.info(f"✅ Сообщение {msg_id} полностью обработано")
+    if msg_id:
+        LAST_MSG_ID = msg_id
+        logger.info(f"✅ Сообщение {msg_id} обработано")
 
 # ===================================================================
-# 6. POLLING LOOP + ИНИЦИАЛИЗАЦИЯ
+# 6. POLLING LOOP
 # ===================================================================
 async def polling_loop():
     """Бесконечный цикл опроса MAX API"""
     global LAST_MSG_ID
     logger.info("🔄 Запуск цикла опроса MAX...")
     
-    # Синхронизация при старте: запоминаем ID самого свежего сообщения
+    # Синхронизация при старте
     logger.info("⏳ Синхронизация с MAX (пропуск старых сообщений)...")
     init_msgs = await max_fetcher.get_latest_messages(limit=1)
     
     if init_msgs:
-        LAST_MSG_ID = str(init_msgs[0].get("id", ""))
+        first = init_msgs[0]
+        LAST_MSG_ID = str(
+            first.get("id") or 
+            first.get("message_id") or 
+            first.get("_id") or 
+            ""
+        )
         logger.info(f"📍 Стартовый ID зафиксирован: {LAST_MSG_ID}")
     else:
-        logger.warning("⚠️ Не удалось получить начальный ID. Будут обработаны все новые.")
+        logger.warning("⚠️ Не удалось получить начальный ID")
 
     while True:
         try:
@@ -286,13 +321,12 @@ async def polling_loop():
             if messages:
                 await process_message(messages[0])
         except Exception as e:
-            logger.error(f"❌ Критическая ошибка в цикле опроса: {e}")
+            logger.error(f"❌ Критическая ошибка в цикле: {e}")
         
-        # Ждём перед следующим запросом
         await asyncio.sleep(POLL_INTERVAL)
 
 # ===================================================================
-# 7. WEB SERVER (ЗДОРОВЬЕ ДЛЯ RENDER / UPTIMEROBOT)
+# 7. WEB SERVER (HEALTH CHECK ДЛЯ RENDER / UPTIMEROBOT)
 # ===================================================================
 async def health_handler(request):
     """Эндпоинт для проверки работоспособности"""
@@ -317,7 +351,6 @@ async def main():
     await site.start()
     logger.info("🌐 Веб-сервер запущен на :8080 (для UptimeRobot)")
     
-    # Запускаем polling цикл
     await polling_loop()
 
 if __name__ == '__main__':
