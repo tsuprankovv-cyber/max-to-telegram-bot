@@ -5,6 +5,7 @@ import asyncio
 import logging
 import aiohttp
 import json
+from aiohttp import web
 from typing import Optional, List, Dict
 
 # ===================================================================
@@ -27,7 +28,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHANNEL_ID = os.getenv('MAX_CHANNEL_ID', '').strip()
-POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '3'))  # Опрос каждые 3 секунды
+POLL_INTERVAL = int(os.getenv('POLL_INTERVAL', '3'))
 
 logger.info("=" * 80)
 logger.info("🚀 ЗАПУСК БОТА-ПЕРЕСЫЛЬЩИКА (MAX -> TELEGRAM) [POLLING]")
@@ -57,10 +58,10 @@ logger.info("✅ Все переменные установлены")
 logger.info("=" * 80)
 
 # ===================================================================
-# СЕССИЯ AIOHTTP
+# СЕССИЯ
 # ===================================================================
 session: Optional[aiohttp.ClientSession] = None
-last_message_id: Optional[int] = None
+last_message_id: Optional[str] = None
 
 async def get_session() -> aiohttp.ClientSession:
     global session
@@ -69,7 +70,7 @@ async def get_session() -> aiohttp.ClientSession:
     return session
 
 # ===================================================================
-# TELEGRAM API CLIENT
+# TELEGRAM CLIENT
 # ===================================================================
 class TelegramClient:
     def __init__(self, token: str):
@@ -79,29 +80,20 @@ class TelegramClient:
     async def send_message(self, chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
         try:
             sess = await get_session()
-            data = {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": parse_mode
-            }
+            data = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
             async with sess.post(f"{self.api_url}/sendMessage", json=data) as resp:
                 if resp.status == 200:
                     logger.info("✅ Сообщение отправлено в Telegram")
                     return True
-                else:
-                    error = await resp.text()
-                    logger.error(f"❌ Telegram API error: {resp.status} - {error[:500]}")
-                    return False
+                return False
         except Exception as e:
-            logger.error(f"❌ send_message exception: {e}")
+            logger.error(f"❌ send_message: {e}")
             return False
 
     async def send_photo(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
         try:
             if len(file_bytes) > 50 * 1024 * 1024:
-                logger.warning(f"⚠️ Фото пропущено (>50MB)")
                 return False
-            
             sess = await get_session()
             data = aiohttp.FormData()
             data.add_field("chat_id", chat_id)
@@ -109,19 +101,16 @@ class TelegramClient:
             if caption:
                 data.add_field("caption", caption)
                 data.add_field("parse_mode", "HTML")
-
             async with sess.post(f"{self.api_url}/sendPhoto", data=data) as resp:
                 return resp.status == 200
         except Exception as e:
-            logger.error(f"❌ send_photo exception: {e}")
+            logger.error(f"❌ send_photo: {e}")
             return False
 
     async def send_video(self, chat_id: str, file_bytes: bytes, caption: str = "") -> bool:
         try:
             if len(file_bytes) > 50 * 1024 * 1024:
-                logger.warning(f"⚠️ Видео пропущено (>50MB)")
                 return False
-            
             sess = await get_session()
             data = aiohttp.FormData()
             data.add_field("chat_id", chat_id)
@@ -129,19 +118,16 @@ class TelegramClient:
             if caption:
                 data.add_field("caption", caption)
                 data.add_field("parse_mode", "HTML")
-
             async with sess.post(f"{self.api_url}/sendVideo", data=data) as resp:
                 return resp.status == 200
         except Exception as e:
-            logger.error(f"❌ send_video exception: {e}")
+            logger.error(f"❌ send_video: {e}")
             return False
 
     async def send_document(self, chat_id: str, file_bytes: bytes, filename: str, caption: str = "") -> bool:
         try:
             if len(file_bytes) > 50 * 1024 * 1024:
-                logger.warning(f"⚠️ Файл пропущен (>50MB)")
                 return False
-
             sess = await get_session()
             data = aiohttp.FormData()
             data.add_field("chat_id", chat_id)
@@ -149,34 +135,14 @@ class TelegramClient:
             if caption:
                 data.add_field("caption", caption)
                 data.add_field("parse_mode", "HTML")
-
             async with sess.post(f"{self.api_url}/sendDocument", data=data) as resp:
                 return resp.status == 200
         except Exception as e:
-            logger.error(f"❌ send_document exception: {e}")
-            return False
-            
-    async def send_audio(self, chat_id: str, file_bytes: bytes, filename: str, caption: str = "") -> bool:
-        try:
-            if len(file_bytes) > 50 * 1024 * 1024:
-                return False
-            
-            sess = await get_session()
-            data = aiohttp.FormData()
-            data.add_field("chat_id", chat_id)
-            data.add_field("audio", file_bytes, filename=filename)
-            if caption:
-                data.add_field("caption", caption)
-                data.add_field("parse_mode", "HTML")
-
-            async with sess.post(f"{self.api_url}/sendAudio", data=data) as resp:
-                return resp.status == 200
-        except Exception as e:
-            logger.error(f"❌ send_audio exception: {e}")
+            logger.error(f"❌ send_document: {e}")
             return False
 
 # ===================================================================
-# MAX API CLIENT (POLLING)
+# MAX CLIENT (POLLING)
 # ===================================================================
 class MaxClient:
     def __init__(self, token: str, channel_id: str):
@@ -184,11 +150,10 @@ class MaxClient:
         self.channel_id = channel_id
         self.base_url = "https://platform-api.max.ru"
 
-    async def get_messages(self, limit: int = 10) -> Optional[List[Dict]]:
-        """Получение последних сообщений из канала Max"""
+    async def get_messages(self, limit: int = 5) -> Optional[List[Dict]]:
         try:
             sess = await get_session()
-            # Адаптируйте эндпоинт под реальное API Max
+            # ⚠️ АДАПТИРУЙТЕ ЭНДПОИНТ ПОД РЕАЛЬНОЕ API MAX
             async with sess.get(
                 f"{self.base_url}/channels/{self.channel_id}/messages",
                 headers={"Authorization": self.token},
@@ -196,17 +161,17 @@ class MaxClient:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return data.get('messages', [])
-                logger.error(f"❌ Max API error: {resp.status}")
+                    # ⚠️ АДАПТИРУЙТЕ ПОЛЯ ПОД ОТВЕТ API MAX
+                    return data.get('messages', []) if isinstance(data, dict) else data
                 return None
         except Exception as e:
-            logger.error(f"❌ get_messages exception: {e}")
+            logger.error(f"❌ get_messages: {e}")
             return None
 
     async def download_file(self, file_token: str) -> Optional[bytes]:
-        """Скачивание файла из Max"""
         try:
             sess = await get_session()
+            # ⚠️ АДАПТИРУЙТЕ ЭНДПОИНТ ПОД РЕАЛЬНОЕ API MAX
             async with sess.get(
                 f"{self.base_url}/files/{file_token}/download",
                 headers={"Authorization": self.token}
@@ -215,37 +180,33 @@ class MaxClient:
                     return await resp.read()
                 return None
         except Exception as e:
-            logger.error(f"❌ download_file exception: {e}")
+            logger.error(f"❌ download_file: {e}")
             return None
 
 # ===================================================================
-# ОБРАБОТЧИК СООБЩЕНИЙ
+# ОБРАБОТКА СООБЩЕНИЯ
 # ===================================================================
 tg_client = TelegramClient(TELEGRAM_BOT_TOKEN)
 max_client = MaxClient(MAX_TOKEN, MAX_CHANNEL_ID)
 
-async def process_max_message( Dict) -> bool:
-    """Обработка одного сообщения из Max"""
+async def process_message(msg: Dict) -> bool:
     try:
-        text = data.get("text", "")
-        attachments = data.get("attachments", [])
-        msg_format = data.get("format", "HTML")
-        message_id = data.get("id")
+        text = msg.get("text", "")
+        attachments = msg.get("attachments", [])
+        msg_format = msg.get("format", "HTML")
+        msg_id = msg.get("id", "unknown")
         
-        logger.info(f"📨 Обработка сообщения #{message_id} из Max")
+        logger.info(f"📨 Обработка сообщения #{msg_id}")
 
-        # 1. Отправка текста
         if text:
             await tg_client.send_message(TELEGRAM_CHAT_ID, text, parse_mode=msg_format)
         
-        # 2. Отправка вложений
         for att in attachments:
             att_type = att.get("type", "")
             caption = text[:1000] if text else ""
             file_bytes = None
             filename = "file"
 
-            # Скачивание файла
             if "token" in att:
                 file_bytes = await max_client.download_file(att["token"])
                 filename = att.get("name", "file")
@@ -257,59 +218,46 @@ async def process_max_message( Dict) -> bool:
                         filename = att.get("name", att["url"].split("/")[-1])
             
             if not file_bytes:
-                logger.warning("⚠️ Не удалось скачать файл")
                 continue
 
-            # Отправка в Telegram
             if att_type == "image":
                 await tg_client.send_photo(TELEGRAM_CHAT_ID, file_bytes, caption)
             elif att_type == "video":
                 await tg_client.send_video(TELEGRAM_CHAT_ID, file_bytes, caption)
-            elif att_type == "audio":
-                await tg_client.send_audio(TELEGRAM_CHAT_ID, file_bytes, filename, caption)
-            elif att_type == "file":
-                await tg_client.send_document(TELEGRAM_CHAT_ID, file_bytes, filename, caption)
-            else:
+            elif att_type in ["audio", "file"]:
                 await tg_client.send_document(TELEGRAM_CHAT_ID, file_bytes, filename, caption)
             
             await asyncio.sleep(0.5)
 
         return True
     except Exception as e:
-        logger.error(f"❌ process_max_message exception: {e}")
+        logger.error(f"❌ process_message: {e}")
         return False
 
 # ===================================================================
 # POLLING ЦИКЛ
 # ===================================================================
 async def polling_loop():
-    """Основной цикл опроса Max API"""
     global last_message_id
     logger.info("🔄 Запуск polling цикла...")
     
     while True:
         try:
-            # Получаем последние сообщения
             messages = await max_client.get_messages(limit=5)
             
-            if messages:
-                # Берём самое новое сообщение
-                latest_message = messages[0]
-                current_id = latest_message.get("id")
+            if messages and isinstance(messages, list) and len(messages) > 0:
+                latest = messages[0]
+                current_id = str(latest.get("id", ""))
                 
-                # Если это новое сообщение (не то, что уже обработали)
-                if current_id != last_message_id:
-                    logger.info(f"🆕 Новое сообщение detected: #{current_id}")
-                    await process_max_message(latest_message)
+                if current_id and current_id != last_message_id:
+                    logger.info(f"🆕 Новое сообщение: #{current_id}")
+                    await process_message(latest)
                     last_message_id = current_id
-                else:
-                    logger.debug("🔄 Новых сообщений нет")
             
-            # Ждём перед следующим опросом
             await asyncio.sleep(POLL_INTERVAL)
             
         except Exception as e:
-            logger.error(f"❌ polling_loop error: {e}")
+            logger.error(f"❌ polling_loop: {e}")
             await asyncio.sleep(POLL_INTERVAL)
 
 # ===================================================================
@@ -320,7 +268,7 @@ async def health_handler(request):
         "status": "ok",
         "service": "max-to-telegram-bot",
         "mode": "polling",
-        "last_message_id": last_message_id
+        "last_id": last_message_id
     })
 
 # ===================================================================
@@ -332,12 +280,11 @@ async def cleanup(app):
         await session.close()
 
 # ===================================================================
-# СОЗДАНИЕ WEB APP
+# СОЗДАНИЕ ПРИЛОЖЕНИЯ
 # ===================================================================
 def create_app():
     app = web.Application()
     app.router.add_get('/health', health_handler)
-    app.on_startup.append(lambda app: logger.info("🚀 Приложение запущено"))
     app.on_shutdown.append(cleanup)
     return app
 
@@ -348,25 +295,19 @@ if __name__ == '__main__':
     try:
         logger.info("🚀 Запуск polling сервера на порту 8080...")
         
-        # Запускаем веб-сервер и polling параллельно
-        async def run_polling():
+        async def run():
+            app = create_app()
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, '0.0.0.0', 8080)
+            await site.start()
+            logger.info("✅ Веб-сервер запущен")
             await polling_loop()
         
-        app = create_app()
-        
-        # Запускаем веб-сервер
-        runner = web.AppRunner(app)
-        asyncio.get_event_loop().run_until_complete(runner.setup())
-        site = web.TCPSite(runner, '0.0.0.0', 8080)
-        asyncio.get_event_loop().run_until_complete(site.start())
-        
-        logger.info("✅ Веб-сервер запущен на http://0.0.0.0:8080")
-        
-        # Запускаем polling
-        asyncio.get_event_loop().run_until_complete(run_polling())
+        asyncio.run(run())
         
     except KeyboardInterrupt:
-        logger.info("🛑 Остановка по сигналу...")
+        logger.info("🛑 Остановка...")
     except Exception as e:
         logger.exception(f"❌ Критическая ошибка: {e}")
         sys.exit(1)
