@@ -17,16 +17,15 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# 2. ПЕРЕМЕННЫЕ (БЕЗ ФАЙЛА СОСТОЯНИЯ)
+# 2. ПЕРЕМЕННЫЕ
 # ===================================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TG_CHAT  = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHAN  = os.getenv('MAX_CHANNEL_ID', '').strip()
 MAX_BASE  = os.getenv('MAX_API_BASE', 'https://platform-api.max.ru')
-POLL_SEC  = int(os.getenv('POLL_INTERVAL', '3'))  # ← 3 секунды (компромисс)
+POLL_SEC  = int(os.getenv('POLL_INTERVAL', '3'))
 
-# Только одно число в памяти (сбрасывается при рестарте — это ок)
 _last_seq = 0
 
 logger.info("=" * 80)
@@ -41,17 +40,15 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
     sys.exit(1)
 
 # ===================================================================
-# 3. КОНВЕРТЕР РАЗМЕТКИ (FIXED: ВСЕ ТИПЫ + ЭМОДЗИ)
+# 3. КОНВЕРТЕР РАЗМЕТКИ
 # ===================================================================
 def apply_markup(text: str, markup: List[Dict]) -> str:
-    """Конвертирует markup MAX → HTML Telegram с поддержкой всех типов"""
     if not markup or not text:
         return text
 
     logger.debug(f"[MARKUP] Input: '{text[:50]}...' | items: {len(markup)}")
     logger.debug(f"[MARKUP] Raw: {json.dumps(markup, ensure_ascii=False)}")
 
-    # Полный маппинг типов MAX → HTML
     TAGS = {
         "strong": ("<b>", "</b>"),
         "bold": ("<b>", "</b>"),
@@ -67,7 +64,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
     }
 
-    # Сортируем с КОНЦА к началу — чтобы вставка тегов не сдвигала индексы
     sorted_markup = sorted(markup, key=lambda x: int(x.get("from", 0)), reverse=True)
     
     result = text
@@ -93,7 +89,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                     open_tag = f'<a href="{url}">'
                     close_tag = "</a>"
             elif mtype in ("mention", "hashtag", "bot_command", "cashtag"):
-                # Эти типы не требуют тегов в Telegram HTML
                 logger.debug(f"[MARKUP] Skipping {mtype} (no tag needed)")
                 continue
             else:
@@ -113,20 +108,17 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     return result
 
 # ===================================================================
-# 4. ИЗВЛЕЧЕНИЕ ДАННЫХ (FIXED: ПРИОРИТЕТ LINK.MESSAGE)
+# 4. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_data(msg: Dict) -> Dict:
-    """Извлекает текст, markup, вложения — с приоритетом для пересылок"""
     logger.debug(f"[PARSE] Top-level keys: {list(msg.keys())}")
     
-    # 🔹 1. Проверяем пересылку (link.message) — ЭТО ВАЖНО!
     link = msg.get("link")
     if isinstance(link, dict) and "message" in link:
         logger.info(f"[PARSE] 📩 Found FORWARD (link.message)")
         inner_msg = link["message"]
         logger.debug(f"[PARSE] Inner keys: {list(inner_msg.keys())}")
         
-        # Рекурсивно извлекаем из вложенного сообщения
         return {
             "source": "link.message",
             "mid": inner_msg.get("mid") or inner_msg.get("id"),
@@ -136,7 +128,6 @@ def extract_data(msg: Dict) -> Dict:
             "attachments": safe_list(inner_msg.get("attachments") or inner_msg.get("files") or inner_msg.get("media"))
         }
     
-    # 🔹 2. Обычное сообщение (body)
     body = msg.get("body", {})
     if isinstance(body, dict) and ("text" in body or "attachments" in body or "markup" in body):
         logger.info(f"[PARSE] 📄 Using body")
@@ -149,7 +140,6 @@ def extract_data(msg: Dict) -> Dict:
             "attachments": safe_list(body.get("attachments") or body.get("files") or body.get("media"))
         }
     
-    # 🔹 3. Резерв: корень сообщения
     logger.info(f"[PARSE] 📦 Using root")
     return {
         "source": "root",
@@ -171,7 +161,7 @@ def safe_list(val: Any) -> List[Dict]:
     return []
 
 # ===================================================================
-# 5. TELEGRAM CLIENT (ОТПРАВКА ПО ССЫЛКЕ ИЛИ ФАЙЛОМ)
+# 5. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token, chat_id):
@@ -210,7 +200,6 @@ class TG:
         })
 
     async def media(self, type_, media, caption="", filename=None, is_url=False):
-        """Универсальная отправка: media = URL (str) или файл (bytes)"""
         if isinstance(media, bytes):
             if len(media) > self.MAX_BYTES:
                 logger.warning(f"[TG-SKIP] {type_} >50MB ({len(media)/1024/1024:.2f} MB)")
@@ -220,16 +209,13 @@ class TG:
         form = aiohttp.FormData()
         form.add_field("chat_id", self.chat_id)
         
-        # Имя поля зависит от типа
         field_map = {"photo": "photo", "video": "video", "audio": "audio", "voice": "voice", "document": "document"}
         tg_field = field_map.get(type_, type_)
         
         if is_url:
-            # 🔹 ОТПРАВКА ПО ССЫЛКЕ (как в TG→MAX боте)
             form.add_field(tg_field, media)
             logger.info(f"[TG-SEND] 📎 {type_.upper()} (URL): {str(media)[:80]}...")
         else:
-            # 🔹 ОТПРАВКА ФАЙЛОМ
             fname = filename or f"{type_}_file"
             form.add_field(tg_field, media, filename=fname)
             logger.info(f"[TG-SEND] 📎 {type_.upper()} (FILE): {len(media)} bytes")
@@ -242,7 +228,7 @@ class TG:
         return await self.send(f"send{type_.capitalize()}", data=form)
 
 # ===================================================================
-# 6. MAX CLIENT (С since_seq)
+# 6. MAX CLIENT
 # ===================================================================
 class MX:
     def __init__(self, token, cid, base):
@@ -259,8 +245,6 @@ class MX:
         await self.init()
         try:
             params = {"chat_id": self.cid, "limit": 10}
-            
-            # 🔹 КЛЮЧЕВОЕ: запрашиваем только сообщения новее last_seq
             if _last_seq > 0:
                 params["since_seq"] = _last_seq
                 logger.debug(f"[MAX-REQ] Fetching since_seq={_last_seq}")
@@ -275,7 +259,6 @@ class MX:
                 if r.status == 200:
                     raw = await r.json()
                     logger.debug(f"[MAX-RESP] Raw: {json.dumps(raw, ensure_ascii=False)[:800]}")
-                    # MAX возвращает {"messages": [...]} или [...]
                     msgs = raw.get("messages", raw) if isinstance(raw, dict) else raw
                     return msgs if isinstance(msgs, list) else []
                 logger.error(f"[MAX-ERR] HTTP {r.status}")
@@ -312,10 +295,8 @@ mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 async def handle(msg):
     global _last_seq
     
-    # 🔹 СУПЕР-ЛОГ: полный JSON сообщения
     logger.info(f"🔍 [RAW-MSG] {json.dumps(msg, ensure_ascii=False)[:1500]}")
     
-    # Извлечение данных
     data = extract_data(msg)
     logger.info(f"[PARSE] Source: {data['source']} | MID: {data['mid']} | SEQ: {data['seq']}")
     logger.info(f"[PARSE] Text: {len(data['text'])}c | Markup: {len(data['markup'])} | Attachments: {len(data['attachments'])}")
@@ -327,24 +308,20 @@ async def handle(msg):
         logger.warning("[SKIP] ❌ No MID found")
         return
     
-    # 🔹 Проверка дублей по SEQ (вместо файла с mid)
     if seq and seq <= _last_seq:
         logger.info(f"[DUPE] ⏭ Skip: seq={seq} <= last_seq={_last_seq}")
         return
     
     logger.info(f"🆕 [NEW] Processing MID: {mid} (seq={seq})")
     
-    # Конвертация разметки
     text = apply_markup(data["text"], data["markup"]) if data["markup"] else data["text"]
     
-    # Отправка текста
     if text:
         logger.info(f"[SEND-TEXT] ▶️ '{text[:100]}{'...' if len(text)>100 else ''}'")
         ok = await tg.text(text)
         logger.info(f"[RESULT] Text: {'✅ OK' if ok else '❌ FAIL'}")
         await asyncio.sleep(0.2)
     
-    # Отправка вложений
     for i, att in enumerate(data["attachments"]):
         logger.info(f"[ATT #{i+1}/{len(data['attachments'])}] ▶️ Processing")
         logger.debug(f"[ATT] Raw: {json.dumps(att, ensure_ascii=False)[:500]}")
@@ -356,14 +333,12 @@ async def handle(msg):
         atype = att.get("type") or att.get("media_type") or "file"
         payload = att.get("payload", {}) if isinstance(att.get("payload"), dict) else {}
         
-        # 🔹 Ищем URL (приоритет!) и токен
         url = payload.get("url") or att.get("url")
         token = payload.get("token") or att.get("token") or att.get("id") or att.get("file_token")
         fname = payload.get("filename") or att.get("filename") or att.get("name") or f"file_{i+1}"
         
         logger.info(f"[ATT] Type: {atype} | Has URL: {bool(url)} | Token: {token[:30] if token else None}... | Name: {fname}")
         
-        # Определение типа для Telegram
         ext = fname.split('.')[-1].lower() if '.' in fname else ''
         tg_type = "document"
         
@@ -381,16 +356,14 @@ async def handle(msg):
         caption = text if tg_type != "document" else ""
         sent = False
         
-        # 🔹 ЛОГИКА ОТПРАВКИ: URL (приоритет) ИЛИ ФАЙЛ
         if url and tg_type == "photo":
-            # Фото по прямой ссылке (как в TG→MAX боте) — БЫСТРО и НАДЁЖНО
             logger.info(f"[SEND] 📤 Photo via URL: {url[:80]}...")
             sent = await tg.media(tg_type, url, caption, is_url=True)
         elif token:
-            # Скачиваем и отправляем файлом
             logger.info(f"[SEND] 📤 Downloading via token...")
             file_data = await mx.download(token)
-            if file_
+            # 🔹 ИСПРАВЛЕНИЕ: было "if file_" → стало "if file_data:"
+            if file_data:
                 logger.info(f"[SEND] 📤 Sending {tg_type}...")
                 sent = await tg.media(tg_type, file_data, caption, filename=fname)
             else:
@@ -399,9 +372,8 @@ async def handle(msg):
             logger.warning(f"[SKIP] ❌ No URL or Token found")
         
         logger.info(f"[RESULT] {tg_type}: {'✅ OK' if sent else '❌ FAIL'}")
-        await asyncio.sleep(0.3)  # Пауза между файлами
+        await asyncio.sleep(0.3)
     
-    # 🔹 Обновляем last_seq ТОЛЬКО после успешной обработки
     if seq:
         _last_seq = int(seq)
         logger.info(f"[STATE] ✅ Updated last_seq: {_last_seq}")
@@ -414,7 +386,7 @@ async def handle(msg):
 async def polling_loop():
     global _last_seq
     logger.info("🔄 Starting polling loop...")
-    await asyncio.sleep(2)  # Ждём готовности сети
+    await asyncio.sleep(2)
     
     logger.info(f"📦 Initial state: last_seq={_last_seq}")
     
@@ -439,7 +411,7 @@ async def polling_loop():
         await asyncio.sleep(POLL_SEC)
 
 # ===================================================================
-# 9. WEB SERVER (HEALTH CHECK)
+# 9. WEB SERVER
 # ===================================================================
 async def health_handler(request):
     return web.json_response({
