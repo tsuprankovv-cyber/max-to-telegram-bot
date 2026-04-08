@@ -44,7 +44,7 @@ logger.info(f"🔗 MAX API Base: {MAX_BASE}")
 logger.info(f"⏱️  Poll Interval: {POLL_SEC}s")
 logger.info(f"🔧 DEBUG_IGNORE_SEQ: {DEBUG_IGNORE_SEQ}")
 logger.info("=" * 100)
-logger.info("🔒 Deduplication: by seq (strict < comparison)")
+logger.info("🔒 Deduplication: by seq (strict <= comparison)")
 logger.info("🎨 Markup: grapheme-aware, all types supported")
 logger.info("📎 Media: URL priority for all types")
 logger.info("🎤 Voice: .ogg/.opus OR size<2MB → sendVoice")
@@ -64,7 +64,7 @@ logger.info("✅ All environment variables present")
 def split_into_graphemes(text: str) -> List[str]:
     """
     Разбивает текст на графемы (визуальные символы) для корректной работы с эмодзи.
-    Эмодзи могут состоять из нескольких кодовых точек (например, 👨‍👩‍👧‍👦 или 🏻).
+    Эмодзи могут состоять из нескольких кодовых точек (например, 👨‍👩‍👧‍ или 🏻).
     """
     logger.debug(f"[GRAPH] Splitting text into graphemes: '{text[:50]}{'...' if len(text)>50 else ''}' (len={len(text)})")
     if not text:
@@ -615,7 +615,7 @@ async def handle(msg: Dict):
     logger.info(f"  ├─ markup_count: {len(data['markup'])}")
     logger.info(f"  └─ attachments_count: {len(data['attachments'])}")
     
-    # 🔹 ДЕДУПЛИКАЦИЯ ПО SEQ (строгое < вместо <=)
+    # 🔹 ДЕДУПЛИКАЦИЯ ПО SEQ (строгое <= вместо <)
     if seq is None:
         if not DEBUG_IGNORE_SEQ:
             logger.warning("[STEP] ❌ No seq field, skipping message")
@@ -624,13 +624,14 @@ async def handle(msg: Dict):
             logger.warning("[STEP] 🔧 DEBUG: No seq but DEBUG_IGNORE_SEQ=1, continuing")
     
     global _last_processed_seq
-    if not DEBUG_IGNORE_SEQ and seq < _last_processed_seq:
-        logger.info(f"[STEP] ⏭ DUPE: msg_seq={seq} < last_seq={_last_processed_seq} | skipping")
+    # 🔹 ИСПРАВЛЕНИЕ: Используем <= для корректной дедупликации при since_seq
+    if not DEBUG_IGNORE_SEQ and seq <= _last_processed_seq:
+        logger.info(f"[STEP] ⏭ DUPE: msg_seq={seq} <= last_seq={_last_processed_seq} | skipping")
         return
     if DEBUG_IGNORE_SEQ:
         logger.warning(f"[STEP] 🔧 DEBUG: Ignoring seq check | seq={seq}")
     
-    logger.info(f"[STEP] ✅ NEW: msg_seq={seq} > last_seq={_last_processed_seq} | processing")
+    logger.info(f"[STEP] ✅ NEW: msg_seq={seq} | processing")
     
     # 🔹 Конвертация разметки
     text = apply_markup(data["text"], data["markup"]) if data["markup"] else data["text"]
