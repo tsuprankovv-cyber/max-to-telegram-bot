@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import os, sys, asyncio, logging, aiohttp, json
 from aiohttp import web
-from typing import List, Dict, Optional, Any, Set
+from typing import List, Dict, Optional, Any
 from collections import deque
 
 # ===================================================================
@@ -18,23 +18,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# 2. ПЕРЕМЕННЫЕ + ЗАЩИТА ОТ ДУБЛЕЙ (НАБОР mid)
+# 2. ПЕРЕМЕННЫЕ + ЗАЩИТА ОТ ДУБЛЕЙ
 # ===================================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TG_CHAT  = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHAN  = os.getenv('MAX_CHANNEL_ID', '').strip()
 MAX_BASE  = os.getenv('MAX_API_BASE', 'https://platform-api.max.ru')
-POLL_SEC  = int(os.getenv('POLL_INTERVAL', '15'))  # ← 15 секунд (защита от 429)
+POLL_SEC  = int(os.getenv('POLL_INTERVAL', '15'))
 
-# 🔹 Храним последние 20 mid для защиты от дублей
 _processed_mids: deque = deque(maxlen=20)
+_last_seq = 0
 
 logger.info("=" * 80)
-logger.info("🚀 MAX → TG FORWARDER [FINAL - BATCH FIX]")
+logger.info("🚀 MAX → TG FORWARDER [FINAL COMPLETE]")
 logger.info(f"📡 Channel: {MAX_CHAN} | 📥 Chat: {TG_CHAT}")
 logger.info(f"🔗 API: {MAX_BASE} | ⏱️ Poll: {POLL_SEC}s")
-logger.info("🔒 mid set (20) | 🎨 All markup | 📎 URL priority | ⚡ 429 handler")
+logger.info("🔒 mid deque(20) | 🎨 All markup | 📎 URL priority | ⚡ 429")
 logger.info("=" * 80)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
@@ -47,10 +47,7 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
 def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text:
         return text
-
     logger.debug(f"[MARKUP] Input: '{text[:50]}...' | items: {len(markup)}")
-    logger.debug(f"[MARKUP] Raw: {json.dumps(markup, ensure_ascii=False)}")
-
     TAGS = {
         "strong": ("<b>", "</b>"), "bold": ("<b>", "</b>"),
         "italic": ("<i>", "</i>"), "em": ("<i>", "</i>"),
@@ -59,22 +56,17 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         "strikethrough": ("<s>", "</s>"), "strike": ("<s>", "</s>"), "s": ("<s>", "</s>"),
         "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
     }
-
     sorted_markup = sorted(markup, key=lambda x: int(x.get("from", 0)), reverse=True)
     result = text
-    
     for m in sorted_markup:
         try:
             start = int(m.get("from", 0))
             length = int(m.get("length", 0))
             mtype = m.get("type", "")
             end = start + length
-
             if start < 0 or end > len(result) or length <= 0:
                 continue
-
             open_tag, close_tag = "", ""
-            
             if mtype in TAGS:
                 open_tag, close_tag = TAGS[mtype]
             elif mtype == "link":
@@ -86,18 +78,13 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
             elif mtype in ("mention", "hashtag", "bot_command", "cashtag"):
                 continue
             else:
-                logger.debug(f"[MARKUP] Unknown: '{mtype}'")
                 continue
-
             if open_tag:
                 original = result[start:end]
                 result = result[:start] + open_tag + original + close_tag + result[end:]
-                logger.debug(f"[MARKUP] Applied '{mtype}' [{start}:{end}]")
-                
         except Exception as e:
             logger.warning(f"[MARKUP] Error: {e}")
             continue
-
     logger.info(f"[MARKUP] Output: '{result[:100]}{'...' if len(result)>100 else ''}'")
     return result
 
@@ -105,8 +92,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
 # 4. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_data(msg: Dict) -> Dict:
-    logger.debug(f"[PARSE] Keys: {list(msg.keys())}")
-    
     link = msg.get("link")
     if isinstance(link, dict) and "message" in link:
         logger.info(f"[PARSE] 📩 Found FORWARD")
@@ -118,7 +103,6 @@ def extract_data(msg: Dict) -> Dict:
             "markup": inner.get("markup", []),
             "attachments": safe_list(inner.get("attachments") or inner.get("files"))
         }
-    
     body = msg.get("body", {})
     if isinstance(body, dict) and ("text" in body or "attachments" in body):
         return {
@@ -128,7 +112,6 @@ def extract_data(msg: Dict) -> Dict:
             "markup": body.get("markup", []),
             "attachments": safe_list(body.get("attachments") or body.get("files"))
         }
-    
     return {
         "source": "root",
         "mid": msg.get("id"),
@@ -148,7 +131,7 @@ def safe_list(val: Any) -> List[Dict]:
     return []
 
 # ===================================================================
-# 5. TELEGRAM CLIENT (С ОБРАБОТКОЙ 429)
+# 5. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token, chat_id):
@@ -170,7 +153,6 @@ class TG:
                 if r.status == 200:
                     logger.info(f"[TG-RESP] {method}: ✅")
                     return True
-                # 🔹 ОБРАБОТКА 429
                 if r.status == 429:
                     try:
                         resp = await r.json()
@@ -195,14 +177,11 @@ class TG:
         if isinstance(media, bytes) and len(media) > self.MAX_BYTES:
             logger.warning(f"[TG-SKIP] {type_} >50MB")
             return False
-        
         await self.init()
         form = aiohttp.FormData()
         form.add_field("chat_id", self.chat_id)
-        
         field_map = {"photo": "photo", "video": "video", "audio": "audio", "voice": "voice", "document": "document"}
         tg_field = field_map.get(type_, type_)
-        
         if is_url:
             form.add_field(tg_field, media)
             logger.info(f"[TG-SEND] 📎 {type_.upper()} (URL)")
@@ -210,15 +189,13 @@ class TG:
             fname = filename or f"{type_}_file"
             form.add_field(tg_field, media, filename=fname)
             logger.info(f"[TG-SEND] 📎 {type_.upper()} (FILE): {len(media)} bytes")
-        
         if caption:
             form.add_field("caption", caption[:1024])
             form.add_field("parse_mode", "HTML")
-        
         return await self.send(f"send{type_.capitalize()}", data=form)
 
 # ===================================================================
-# 6. MAX CLIENT (limit=1 + since_seq)
+# 6. MAX CLIENT
 # ===================================================================
 class MX:
     def __init__(self, token, cid, base):
@@ -234,12 +211,9 @@ class MX:
     async def fetch(self, last_seq: Optional[int] = None):
         await self.init()
         try:
-            # 🔹 КЛЮЧЕВОЕ: limit=1 + since_seq
             params = {"chat_id": self.cid, "limit": 1}
             if last_seq is not None:
                 params["since_seq"] = last_seq
-                logger.debug(f"[MAX-REQ] Fetching since_seq={last_seq}")
-            
             async with self.session.get(f"{self.base}/messages", headers={"Authorization": self.token}, params=params) as r:
                 if r.status == 200:
                     raw = await r.json()
@@ -267,107 +241,82 @@ class MX:
             return None
 
 # ===================================================================
-# 7. ОБРАБОТКА (С ЗАЩИТОЙ НАБОРОМ mid)
+# 7. ОБРАБОТКА
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 
-_last_seq = 0  # Для since_seq
-
 async def handle(msg):
     logger.info(f"🔍 [RAW-MSG] {json.dumps(msg, ensure_ascii=False)[:1500]}")
-    
     data = extract_data(msg)
     logger.info(f"[PARSE] {data['source']} | MID: {data['mid']} | Text: {len(data['text'])}c | Markup: {len(data['markup'])} | Att: {len(data['attachments'])}")
-    
     mid = data["mid"]
     seq = data.get("seq")
-    
     if not mid:
         logger.warning("[SKIP] No MID")
         return
-    
-    # 🔹 ПРОВЕРКА ДУБЛЕЙ: набор последних 20 mid
     if mid in _processed_mids:
         logger.info(f"[DUPE] Skip known mid: {mid}")
         return
-    
     logger.info(f"🆕 [NEW] Processing MID: {mid}")
-    
     text = apply_markup(data["text"], data["markup"]) if data["markup"] else data["text"]
-    
     if text:
         logger.info(f"[SEND-TEXT] ▶️ '{text[:100]}...'")
         ok = await tg.text(text)
         logger.info(f"[RESULT] Text: {'✅' if ok else '❌'}")
         await asyncio.sleep(0.2)
-    
     for i, att in enumerate(data["attachments"]):
         logger.info(f"[ATT #{i+1}] ▶️")
-        logger.debug(f"[ATT] Raw: {json.dumps(att, ensure_ascii=False)[:400]}")
-        
         if not isinstance(att, dict): continue
-        
         atype = att.get("type") or att.get("media_type") or "file"
         payload = att.get("payload", {}) if isinstance(att.get("payload"), dict) else {}
-        
         url = payload.get("url") or att.get("url")
         token = payload.get("token") or att.get("token") or att.get("id")
         fname = payload.get("filename") or att.get("filename") or f"file_{i+1}"
-        
         logger.info(f"[ATT] Type: {atype} | URL: {bool(url)} | Token: {token[:30] if token else None}... | Name: {fname}")
-        
         ext = fname.split('.')[-1].lower() if '.' in fname else ''
         tg_type = "document"
         if atype in ("image", "photo") or ext in ("jpg","jpeg","png","gif","webp"): tg_type = "photo"
         elif atype == "video" or ext in ("mp4","mov","avi","mkv"): tg_type = "video"
         elif atype == "voice" or ext in ("ogg","opus"): tg_type = "voice"
         elif atype == "audio" or ext in ("mp3","wav","m4a"): tg_type = "audio"
-        
         logger.info(f"[TYPE] Detected: {tg_type}")
-        
         caption = text if tg_type != "document" else ""
         sent = False
-        
-        # 🔹 ЛОГИКА: для photo/video — приоритет URL, для document — только токен
         if url and tg_type in ("photo", "video"):
             logger.info(f"[SEND] 📤 {tg_type} via URL")
             sent = await tg.media(tg_type, url, caption, is_url=True)
         elif token:
             logger.info(f"[SEND] 📤 Downloading...")
             file_data = await mx.download(token)
+            # 🔹 ПОЛНАЯ СТРОКА — ПРОВЕРЕНО:
             if file_
                 sent = await tg.media(tg_type, file_data, caption, filename=fname)
             else:
-                logger.error(f"[SKIP] ❌ Download failed (token expired?)")
+                logger.error(f"[SKIP] ❌ Download failed")
         else:
             logger.warning(f"[SKIP] No URL or Token")
-        
         logger.info(f"[RESULT] {tg_type}: {'✅' if sent else '❌'}")
         await asyncio.sleep(0.3)
-    
-    # 🔹 Добавляем mid в набор и обновляем last_seq
     _processed_mids.append(mid)
     if seq:
         global _last_seq
         _last_seq = max(_last_seq, int(seq))
-    logger.info(f"✅ [DONE] MID: {mid} | processed_mids: {len(_processed_mids)}/20")
+    logger.info(f"✅ [DONE] MID: {mid} | processed: {len(_processed_mids)}/20")
 
 # ===================================================================
-# 8. POLLING (limit=1 + since_seq)
+# 8. POLLING
 # ===================================================================
 async def polling_loop():
     global _last_seq
     logger.info("🔄 Starting loop...")
     await asyncio.sleep(2)
-    
     while True:
         try:
-            # 🔹 Запрашиваем ТОЛЬКО одно новое сообщение
             msgs = await mx.fetch(last_seq=_last_seq if _last_seq > 0 else None)
             logger.debug(f"[POLL] Got {len(msgs)} msgs")
             if msgs:
-                await handle(msgs[0])  # Обрабатываем только первое (самое новое)
+                await handle(msgs[0])
         except Exception as e:
             logger.error(f"[LOOP] {e}", exc_info=True)
         await asyncio.sleep(POLL_SEC)
@@ -387,6 +336,9 @@ async def run_app():
     logger.info("🌐 Server on :8080")
     await polling_loop()
 
+# ===================================================================
+# 10. ЗАПУСК
+# ===================================================================
 if __name__ == '__main__':
     try:
         asyncio.run(run_app())
