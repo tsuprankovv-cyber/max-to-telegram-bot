@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 import os, sys, asyncio, logging, aiohttp, json
 from aiohttp import web
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Set
+from collections import deque
 
 # ===================================================================
-# 1. ЛОГИРОВАНИЕ (МАКСИМУМ ДЕТАЛЕЙ)
+# 1. ЛОГИРОВАНИЕ
 # ===================================================================
 logging.basicConfig(
     level=logging.DEBUG,
@@ -17,22 +18,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# 2. ПЕРЕМЕННЫЕ + ЗАЩИТА ОТ ДУБЛЕЙ (ОДИН last_mid В ПАМЯТИ)
+# 2. ПЕРЕМЕННЫЕ + ЗАЩИТА ОТ ДУБЛЕЙ (НАБОР mid)
 # ===================================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TG_CHAT  = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHAN  = os.getenv('MAX_CHANNEL_ID', '').strip()
 MAX_BASE  = os.getenv('MAX_API_BASE', 'https://platform-api.max.ru')
-POLL_SEC  = int(os.getenv('POLL_INTERVAL', '10'))  # ← 10 секунд (защита от 429)
+POLL_SEC  = int(os.getenv('POLL_INTERVAL', '15'))  # ← 15 секунд (защита от 429)
 
-_last_mid = None  # Простая защита: запоминаем последний обработанный mid
+# 🔹 Храним последние 20 mid для защиты от дублей
+_processed_mids: deque = deque(maxlen=20)
 
 logger.info("=" * 80)
-logger.info("🚀 MAX → TG FORWARDER [FINAL - DUPES + RATE LIMIT FIX]")
+logger.info("🚀 MAX → TG FORWARDER [FINAL - BATCH FIX]")
 logger.info(f"📡 Channel: {MAX_CHAN} | 📥 Chat: {TG_CHAT}")
 logger.info(f"🔗 API: {MAX_BASE} | ⏱️ Poll: {POLL_SEC}s")
-logger.info("🔒 last_mid check | 🎨 All markup | 📎 URL priority | ⚡ 429 handler")
+logger.info("🔒 mid set (20) | 🎨 All markup | 📎 URL priority | ⚡ 429 handler")
 logger.info("=" * 80)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
@@ -40,7 +42,7 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
     sys.exit(1)
 
 # ===================================================================
-# 3. КОНВЕРТЕР РАЗМЕТКИ (ВСЕ ТИПЫ)
+# 3. КОНВЕРТЕР РАЗМЕТКИ
 # ===================================================================
 def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text:
@@ -58,7 +60,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
     }
 
-    # Сортируем с КОНЦА к началу — чтобы вставка тегов не сдвигала индексы
     sorted_markup = sorted(markup, key=lambda x: int(x.get("from", 0)), reverse=True)
     result = text
     
@@ -101,7 +102,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     return result
 
 # ===================================================================
-# 4. ИЗВЛЕЧЕНИЕ ДАННЫХ (ПРИОРИТЕТ LINK.MESSAGE)
+# 4. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_data(msg: Dict) -> Dict:
     logger.debug(f"[PARSE] Keys: {list(msg.keys())}")
@@ -169,14 +170,14 @@ class TG:
                 if r.status == 200:
                     logger.info(f"[TG-RESP] {method}: ✅")
                     return True
-                # 🔹 ОБРАБОТКА 429 (Rate Limit)
+                # 🔹 ОБРАБОТКА 429
                 if r.status == 429:
                     try:
                         resp = await r.json()
                         retry_after = resp.get("parameters", {}).get("retry_after", 10)
                         logger.warning(f"[TG] Rate limit: waiting {retry_after}s")
                         await asyncio.sleep(retry_after)
-                        return await self.send(method, **kw)  # Повторить запрос
+                        return await self.send(method, **kw)
                     except:
                         pass
                 logger.error(f"[TG-RESP] {method}: ❌ {r.status} | {txt[:200]}")
@@ -217,7 +218,7 @@ class TG:
         return await self.send(f"send{type_.capitalize()}", data=form)
 
 # ===================================================================
-# 6. MAX CLIENT
+# 6. MAX CLIENT (limit=1 + since_seq)
 # ===================================================================
 class MX:
     def __init__(self, token, cid, base):
@@ -230,10 +231,15 @@ class MX:
         if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
 
-    async def fetch(self):
+    async def fetch(self, last_seq: Optional[int] = None):
         await self.init()
         try:
-            params = {"chat_id": self.cid, "limit": 5}
+            # 🔹 КЛЮЧЕВОЕ: limit=1 + since_seq
+            params = {"chat_id": self.cid, "limit": 1}
+            if last_seq is not None:
+                params["since_seq"] = last_seq
+                logger.debug(f"[MAX-REQ] Fetching since_seq={last_seq}")
+            
             async with self.session.get(f"{self.base}/messages", headers={"Authorization": self.token}, params=params) as r:
                 if r.status == 200:
                     raw = await r.json()
@@ -261,27 +267,29 @@ class MX:
             return None
 
 # ===================================================================
-# 7. ОБРАБОТКА (С ЗАЩИТОЙ last_mid)
+# 7. ОБРАБОТКА (С ЗАЩИТОЙ НАБОРОМ mid)
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 
+_last_seq = 0  # Для since_seq
+
 async def handle(msg):
-    global _last_mid
-    
     logger.info(f"🔍 [RAW-MSG] {json.dumps(msg, ensure_ascii=False)[:1500]}")
     
     data = extract_data(msg)
     logger.info(f"[PARSE] {data['source']} | MID: {data['mid']} | Text: {len(data['text'])}c | Markup: {len(data['markup'])} | Att: {len(data['attachments'])}")
     
     mid = data["mid"]
+    seq = data.get("seq")
+    
     if not mid:
         logger.warning("[SKIP] No MID")
         return
     
-    # 🔹 ПРОСТАЯ ЗАЩИТА ОТ ДУБЛЕЙ: один last_mid в памяти
-    if mid == _last_mid:
-        logger.info(f"[DUPE] Skip same mid: {mid}")
+    # 🔹 ПРОВЕРКА ДУБЛЕЙ: набор последних 20 mid
+    if mid in _processed_mids:
+        logger.info(f"[DUPE] Skip known mid: {mid}")
         return
     
     logger.info(f"🆕 [NEW] Processing MID: {mid}")
@@ -321,15 +329,14 @@ async def handle(msg):
         caption = text if tg_type != "document" else ""
         sent = False
         
+        # 🔹 ЛОГИКА: для photo/video — приоритет URL, для document — только токен
         if url and tg_type in ("photo", "video"):
-            # Приоритет: фото и видео по ссылке
             logger.info(f"[SEND] 📤 {tg_type} via URL")
             sent = await tg.media(tg_type, url, caption, is_url=True)
         elif token:
-            # Скачиваем и отправляем файлом
             logger.info(f"[SEND] 📤 Downloading...")
             file_data = await mx.download(token)
-            if file_data:
+            if file_
                 sent = await tg.media(tg_type, file_data, caption, filename=fname)
             else:
                 logger.error(f"[SKIP] ❌ Download failed (token expired?)")
@@ -339,24 +346,28 @@ async def handle(msg):
         logger.info(f"[RESULT] {tg_type}: {'✅' if sent else '❌'}")
         await asyncio.sleep(0.3)
     
-    # 🔹 Запоминаем mid ТОЛЬКО после успешной обработки
-    _last_mid = mid
-    logger.info(f"✅ [DONE] MID: {mid} | last_mid updated")
+    # 🔹 Добавляем mid в набор и обновляем last_seq
+    _processed_mids.append(mid)
+    if seq:
+        global _last_seq
+        _last_seq = max(_last_seq, int(seq))
+    logger.info(f"✅ [DONE] MID: {mid} | processed_mids: {len(_processed_mids)}/20")
 
 # ===================================================================
-# 8. POLLING
+# 8. POLLING (limit=1 + since_seq)
 # ===================================================================
 async def polling_loop():
-    global _last_mid
+    global _last_seq
     logger.info("🔄 Starting loop...")
     await asyncio.sleep(2)
     
     while True:
         try:
-            msgs = await mx.fetch()
+            # 🔹 Запрашиваем ТОЛЬКО одно новое сообщение
+            msgs = await mx.fetch(last_seq=_last_seq if _last_seq > 0 else None)
             logger.debug(f"[POLL] Got {len(msgs)} msgs")
-            for msg in msgs:
-                await handle(msg)
+            if msgs:
+                await handle(msgs[0])  # Обрабатываем только первое (самое новое)
         except Exception as e:
             logger.error(f"[LOOP] {e}", exc_info=True)
         await asyncio.sleep(POLL_SEC)
@@ -365,7 +376,7 @@ async def polling_loop():
 # 9. SERVER
 # ===================================================================
 async def health_handler(request):
-    return web.json_response({"ok": True, "last_mid": _last_mid})
+    return web.json_response({"ok": True, "processed": len(_processed_mids), "last_seq": _last_seq})
 
 async def run_app():
     app = web.Application()
