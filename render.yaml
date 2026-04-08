@@ -19,3 +19,5 @@ services:
         value: "15"
       - key: PYTHONUNBUFFERED
         value: "1"
+      - key: DEBUG_IGNORE_SEQ
+        value: "0"
