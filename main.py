@@ -4,7 +4,7 @@ from aiohttp import web
 from typing import List, Dict, Optional, Any
 
 # ===================================================================
-# 1. ЛОГИРОВАНИЕ
+# 1. ЛОГИРОВАНИЕ (МАКСИМУМ ДЕТАЛЕЙ)
 # ===================================================================
 logging.basicConfig(
     level=logging.DEBUG,
@@ -17,20 +17,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# 2. ПЕРЕМЕННЫЕ
+# 2. ПЕРЕМЕННЫЕ + ЗАЩИТА ОТ ДУБЛЕЙ (ОДИН last_mid В ПАМЯТИ)
 # ===================================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TG_CHAT  = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHAN  = os.getenv('MAX_CHANNEL_ID', '').strip()
 MAX_BASE  = os.getenv('MAX_API_BASE', 'https://platform-api.max.ru')
-POLL_SEC  = int(os.getenv('POLL_INTERVAL', '3'))
+POLL_SEC  = int(os.getenv('POLL_INTERVAL', '10'))  # ← 10 секунд (защита от 429)
+
+_last_mid = None  # Простая защита: запоминаем последний обработанный mid
 
 logger.info("=" * 80)
-logger.info("🚀 MAX → TG FORWARDER [FINAL FIX]")
+logger.info("🚀 MAX → TG FORWARDER [FINAL - DUPES + RATE LIMIT FIX]")
 logger.info(f"📡 Channel: {MAX_CHAN} | 📥 Chat: {TG_CHAT}")
 logger.info(f"🔗 API: {MAX_BASE} | ⏱️ Poll: {POLL_SEC}s")
-logger.info("🔒 No seq check | 🎨 All markup | 📎 URL priority")
+logger.info("🔒 last_mid check | 🎨 All markup | 📎 URL priority | ⚡ 429 handler")
 logger.info("=" * 80)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
@@ -38,7 +40,7 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
     sys.exit(1)
 
 # ===================================================================
-# 3. КОНВЕРТЕР РАЗМЕТКИ
+# 3. КОНВЕРТЕР РАЗМЕТКИ (ВСЕ ТИПЫ)
 # ===================================================================
 def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text:
@@ -56,6 +58,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
     }
 
+    # Сортируем с КОНЦА к началу — чтобы вставка тегов не сдвигала индексы
     sorted_markup = sorted(markup, key=lambda x: int(x.get("from", 0)), reverse=True)
     result = text
     
@@ -98,7 +101,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     return result
 
 # ===================================================================
-# 4. ИЗВЛЕЧЕНИЕ ДАННЫХ
+# 4. ИЗВЛЕЧЕНИЕ ДАННЫХ (ПРИОРИТЕТ LINK.MESSAGE)
 # ===================================================================
 def extract_data(msg: Dict) -> Dict:
     logger.debug(f"[PARSE] Keys: {list(msg.keys())}")
@@ -144,7 +147,7 @@ def safe_list(val: Any) -> List[Dict]:
     return []
 
 # ===================================================================
-# 5. TELEGRAM CLIENT
+# 5. TELEGRAM CLIENT (С ОБРАБОТКОЙ 429)
 # ===================================================================
 class TG:
     def __init__(self, token, chat_id):
@@ -166,6 +169,16 @@ class TG:
                 if r.status == 200:
                     logger.info(f"[TG-RESP] {method}: ✅")
                     return True
+                # 🔹 ОБРАБОТКА 429 (Rate Limit)
+                if r.status == 429:
+                    try:
+                        resp = await r.json()
+                        retry_after = resp.get("parameters", {}).get("retry_after", 10)
+                        logger.warning(f"[TG] Rate limit: waiting {retry_after}s")
+                        await asyncio.sleep(retry_after)
+                        return await self.send(method, **kw)  # Повторить запрос
+                    except:
+                        pass
                 logger.error(f"[TG-RESP] {method}: ❌ {r.status} | {txt[:200]}")
                 return False
         except Exception as e:
@@ -248,12 +261,14 @@ class MX:
             return None
 
 # ===================================================================
-# 7. ОБРАБОТКА (БЕЗ ПРОВЕРКИ SEQ)
+# 7. ОБРАБОТКА (С ЗАЩИТОЙ last_mid)
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 
 async def handle(msg):
+    global _last_mid
+    
     logger.info(f"🔍 [RAW-MSG] {json.dumps(msg, ensure_ascii=False)[:1500]}")
     
     data = extract_data(msg)
@@ -262,6 +277,11 @@ async def handle(msg):
     mid = data["mid"]
     if not mid:
         logger.warning("[SKIP] No MID")
+        return
+    
+    # 🔹 ПРОСТАЯ ЗАЩИТА ОТ ДУБЛЕЙ: один last_mid в памяти
+    if mid == _last_mid:
+        logger.info(f"[DUPE] Skip same mid: {mid}")
         return
     
     logger.info(f"🆕 [NEW] Processing MID: {mid}")
@@ -301,29 +321,33 @@ async def handle(msg):
         caption = text if tg_type != "document" else ""
         sent = False
         
-        if url and tg_type == "photo":
-            logger.info(f"[SEND] 📤 Photo via URL")
+        if url and tg_type in ("photo", "video"):
+            # Приоритет: фото и видео по ссылке
+            logger.info(f"[SEND] 📤 {tg_type} via URL")
             sent = await tg.media(tg_type, url, caption, is_url=True)
         elif token:
+            # Скачиваем и отправляем файлом
             logger.info(f"[SEND] 📤 Downloading...")
             file_data = await mx.download(token)
-            # 🔹 ИСПРАВЛЕНИЕ: ПОЛНАЯ СТРОКА (было обрезано)
             if file_data:
                 sent = await tg.media(tg_type, file_data, caption, filename=fname)
             else:
-                logger.error(f"[SKIP] ❌ Download failed")
+                logger.error(f"[SKIP] ❌ Download failed (token expired?)")
         else:
             logger.warning(f"[SKIP] No URL or Token")
         
         logger.info(f"[RESULT] {tg_type}: {'✅' if sent else '❌'}")
         await asyncio.sleep(0.3)
     
-    logger.info(f"✅ [DONE] MID: {mid}")
+    # 🔹 Запоминаем mid ТОЛЬКО после успешной обработки
+    _last_mid = mid
+    logger.info(f"✅ [DONE] MID: {mid} | last_mid updated")
 
 # ===================================================================
 # 8. POLLING
 # ===================================================================
 async def polling_loop():
+    global _last_mid
     logger.info("🔄 Starting loop...")
     await asyncio.sleep(2)
     
@@ -341,7 +365,7 @@ async def polling_loop():
 # 9. SERVER
 # ===================================================================
 async def health_handler(request):
-    return web.json_response({"ok": True})
+    return web.json_response({"ok": True, "last_mid": _last_mid})
 
 async def run_app():
     app = web.Application()
