@@ -3,6 +3,7 @@ __pycache__/
 *.log
 .env
 bot_debug.log
+bot_state.json
 *.pyo
 *.pyd
 .Python
