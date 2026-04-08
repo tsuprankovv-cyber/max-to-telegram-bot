@@ -4,7 +4,7 @@ from aiohttp import web
 from typing import List, Dict, Optional, Any, Union
 
 # ===================================================================
-# 1. ЛОГИРОВАНИЕ (МАКСИМУМ ДЕТАЛЕЙ)
+# 1. ЛОГИРОВАНИЕ
 # ===================================================================
 logging.basicConfig(
     level=logging.DEBUG,
@@ -17,16 +17,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ===================================================================
-# 2. ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
+# 2. ПЕРЕМЕННЫЕ
 # ===================================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '').strip()
 TG_CHAT  = os.getenv('TELEGRAM_CHAT_ID', '').strip()
 MAX_TOKEN = os.getenv('MAX_TOKEN', '').strip()
 MAX_CHAN  = os.getenv('MAX_CHANNEL_ID', '').strip()
 MAX_BASE  = os.getenv('MAX_API_BASE', 'https://platform-api.max.ru')
-POLL_SEC  = int(os.getenv('POLL_INTERVAL', '1'))  # ← 1 СЕКУНДА
+POLL_SEC  = int(os.getenv('POLL_INTERVAL', '1'))
 
-_processed = set()  # Кэш хэшей для защиты от дублей
+_processed = set()
 
 logger.info("=" * 90)
 logger.info("🚀 MAX → TG FORWARDER [ULTIMATE EDITION]")
@@ -40,7 +40,7 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
     sys.exit(1)
 
 # ===================================================================
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# 3. HELPERS
 # ===================================================================
 def safe_str(val: Any) -> str:
     if val is None: return ""
@@ -61,34 +61,26 @@ def safe_list(val: Any) -> List[Dict]:
     return []
 
 def get_hash(msg: Dict) -> str:
-    """Стабильный хэш ТОЛЬКО по mid (игнорирует views, timestamp и др.)"""
     body = msg.get("body", {}) if isinstance(msg.get("body"), dict) else {}
     mid = body.get("mid") or msg.get("id") or msg.get("message_id") or msg.get("_id") or ""
     return hashlib.md5(str(mid).encode()).hexdigest()[:12] if mid else ""
 
 def guess_media_type(filename: str, att_type: str) -> str:
-    """Определяет тип медиа для Telegram API по расширению и типу из MAX"""
     att_type = att_type.lower() if att_type else ""
     ext = filename.split('.')[-1].lower() if '.' in filename else ""
-    
-    # Приоритет: явный тип из MAX
     if att_type in ("photo", "image", "picture"): return "photo"
     if att_type == "video": return "video"
     if att_type == "audio": return "audio"
     if att_type == "voice": return "voice"
     if att_type == "sticker": return "document"
-    
-    # Определение по расширению
     if ext in ("jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff"): return "photo"
     if ext in ("mp4", "mov", "avi", "mkv", "webm", "flv", "m4v"): return "video"
     if ext in ("mp3", "wav", "ogg", "m4a", "flac", "opus", "aac"): return "audio"
-    if ext in ("oga", "opus"): return "voice"  # Голосовые обычно в opus/oga
-    
-    # По умолчанию — документ
+    if ext in ("oga", "opus"): return "voice"
     return "document"
 
 # ===================================================================
-# 4. TELEGRAM CLIENT (ВСЕ МЕТОДЫ ОТПРАВКИ)
+# 4. TELEGRAM CLIENT
 # ===================================================================
 class TelegramClient:
     def __init__(self, token: str, chat_id: str):
@@ -96,8 +88,8 @@ class TelegramClient:
         self.chat_id = chat_id
         self.base = f"https://api.telegram.org/bot{token}"
         self.session: Optional[aiohttp.ClientSession] = None
-        self.MAX_BYTES = 50 * 1024 * 1024  # 50 МБ — лимит Telegram Bot API
-        self.MAX_CAPTION = 1024             # Лимит подписи
+        self.MAX_BYTES = 50 * 1024 * 1024
+        self.MAX_CAPTION = 1024
 
     async def init(self):
         if not self.session or self.session.closed:
@@ -139,7 +131,7 @@ class TelegramClient:
             form.add_field("parse_mode", "HTML")
         return await self._request("sendPhoto", data=form)
 
-    async def send_video(self,  bytes, caption: str = "", filename: str = "video.mp4") -> bool:
+    async def send_video(self, data: bytes, caption: str = "", filename: str = "video.mp4") -> bool:
         if len(data) > self.MAX_BYTES:
             logger.warning(f"⚠️ Video >50MB skipped: {filename}")
             return False
@@ -147,7 +139,7 @@ class TelegramClient:
         form = aiohttp.FormData()
         form.add_field("chat_id", self.chat_id)
         form.add_field("video", data, filename=filename)
-        form.add_field("supports_streaming", "true")  # Важно для видео
+        form.add_field("supports_streaming", "true")
         if caption:
             form.add_field("caption", caption[:self.MAX_CAPTION])
             form.add_field("parse_mode", "HTML")
@@ -193,7 +185,7 @@ class TelegramClient:
         return await self._request("sendDocument", data=form)
 
 # ===================================================================
-# 5. MAX CLIENT (ПОЛУЧЕНИЕ + СКАЧИВАНИЕ)
+# 5. MAX CLIENT
 # ===================================================================
 class MaxClient:
     def __init__(self, token: str, cid: str, base: str):
@@ -232,7 +224,7 @@ class MaxClient:
                 headers={"Authorization": self.token}
             ) as r:
                 if r.status == 200:
-                    <|fim_suffix|>
+                    data = await r.read()
                     logger.debug(f"[MAX] Downloaded {len(data)} bytes")
                     return data
                 logger.warning(f"⚠️ MAX download HTTP {r.status}")
@@ -242,7 +234,7 @@ class MaxClient:
             return None
 
 # ===================================================================
-# 6. ОБРАБОТКА СООБЩЕНИЙ (ПОЛНАЯ ПОДДЕРЖКА ВСЕХ ФОРМАТОВ)
+# 6. ОБРАБОТКА СООБЩЕНИЙ
 # ===================================================================
 tg = TelegramClient(TG_TOKEN, TG_CHAT)
 mx = MaxClient(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -250,7 +242,6 @@ mx = MaxClient(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 async def handle_message(msg: Dict):
     logger.info(f"[HANDLE] Received: {json.dumps(msg, ensure_ascii=False)[:400]}")
     
-    # 🔒 Стабильный хэш только по mid
     h = get_hash(msg)
     if not h:
         logger.warning("[SKIP] Could not extract mid for hashing")
@@ -262,15 +253,12 @@ async def handle_message(msg: Dict):
         logger.info(f"[DUPE] Skip already processed: {h}")
         return
     
-    # 🔒 Немедленно добавляем в кэш ДО любой отправки
     _processed.add(h)
     logger.info(f"[CACHE] Added hash: {h} (cache size: {len(_processed)})")
 
-    # Извлечение полей с учётом структуры MAX
     body = msg.get("body", {}) if isinstance(msg.get("body"), dict) else {}
     mid = safe_str(body.get("mid") or msg.get("id") or msg.get("message_id"))
     
-    # Текст: ищем в body.text, msg.text, msg.content, msg.body, msg.message
     text = safe_str(
         body.get("text") or 
         msg.get("text") or 
@@ -280,7 +268,6 @@ async def handle_message(msg: Dict):
         (msg.get("payload", {}).get("text") if isinstance(msg.get("payload"), dict) else None)
     )
     
-    # Вложения: проверяем несколько уровней вложенности
     attachments = safe_list(
         body.get("attachments") or 
         msg.get("attachments") or 
@@ -296,22 +283,15 @@ async def handle_message(msg: Dict):
         logger.info(f"[SKIP] Empty mid, skipping message")
         return
 
-    # ===================================================================
-    # ОТПРАВКА ТЕКСТА
-    # ===================================================================
     if text:
         logger.info(f"[SEND-TEXT] '{text[:150]}{'...' if len(text) > 150 else ''}'")
         await tg.send_text(text)
 
-    # ===================================================================
-    # ОТПРАВКА ВЛОЖЕНИЙ (АЛЬБОМЫ, КОМБО, ВСЕ ТИПЫ)
-    # ===================================================================
     for i, att in enumerate(attachments):
         if not isinstance(att, dict):
             logger.warning(f"[SKIP] Attachment #{i+1} is not dict: {type(att)}")
             continue
         
-        # Извлечение данных вложения
         att_type = safe_str(att.get("type") or att.get("media_type") or att.get("mime_type") or "file")
         token = safe_str(att.get("token") or att.get("file_token") or att.get("id") or att.get("file_id"))
         filename = safe_str(att.get("name") or att.get("filename") or att.get("file_name") or f"file_{i+1}")
@@ -323,7 +303,6 @@ async def handle_message(msg: Dict):
             logger.warning(f"[SKIP] No token in attachment #{i+1}")
             continue
 
-        # Скачивание файла
         logger.info(f"[DOWNLOAD] Starting: {filename}")
         file_data = await mx.download(token)
         
@@ -333,17 +312,14 @@ async def handle_message(msg: Dict):
         
         logger.info(f"[DOWNLOADED] {filename}: {len(file_data)} bytes")
 
-        # Определение типа для Telegram
         tg_type = guess_media_type(filename, att_type)
         logger.info(f"[MEDIA-TYPE] Detected: {tg_type} (from att_type:{att_type}, ext:{filename.split('.')[-1] if '.' in filename else 'none'})")
 
-        # Подготовка подписи
         caption = text if text and tg_type != "document" else ""
         if caption and len(caption) > tg.MAX_CAPTION:
             caption = caption[:tg.MAX_CAPTION - 3] + "..."
             logger.warning(f"[CAPTION] Truncated to {tg.MAX_CAPTION} chars")
 
-        # Отправка в Telegram
         logger.info(f"[SEND-{tg_type.upper()}] {filename} | caption:{bool(caption)}")
         sent = False
         
@@ -356,7 +332,7 @@ async def handle_message(msg: Dict):
                 sent = await tg.send_audio(file_data, caption, filename)
             elif tg_type == "voice":
                 sent = await tg.send_voice(file_data, caption)
-            else:  # document
+            else:
                 sent = await tg.send_document(file_data, caption, filename)
         except Exception as e:
             logger.error(f"❌ Send exception: {e}")
@@ -367,20 +343,17 @@ async def handle_message(msg: Dict):
         else:
             logger.error(f"❌ Failed to send {tg_type}: {filename}")
         
-        # Пауза между файлами (чтобы Telegram не забанил за спам)
         await asyncio.sleep(0.3)
 
     logger.info(f"✅ DONE: {mid} (hash:{h}) | attachments processed: {len(attachments)}")
 
 # ===================================================================
-# 7. POLLING LOOP + WEB SERVER
+# 7. POLLING + SERVER
 # ===================================================================
 async def polling_loop():
     logger.info("🔄 Starting polling loop...")
-    
-    # Синхронизация при старте: кешируем последние сообщения
     logger.info("⏳ Sync: caching recent messages to avoid duplicates...")
-    await asyncio.sleep(2)  # Ждём готовности сети Render
+    await asyncio.sleep(2)
     
     init_msgs = await mx.fetch(limit=50)
     for m in init_msgs:
@@ -395,7 +368,6 @@ async def polling_loop():
         logger.debug(f"[POLL] Iteration #{poll_count}")
         
         try:
-            # Берём только самое новое сообщение
             messages = await mx.fetch(limit=1)
             logger.debug(f"[POLL] Received {len(messages)} messages from MAX")
             
@@ -421,20 +393,13 @@ async def health_handler(request):
 async def run_app():
     app = web.Application()
     app.router.add_get('/health', health_handler)
-    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', 8080)
     await site.start()
-    
     logger.info("🌐 Health server running on :8080 (UptimeRobot compatible)")
-    
-    # Запускаем polling
     await polling_loop()
 
-# ===================================================================
-# 8. ЗАПУСК
-# ===================================================================
 if __name__ == '__main__':
     try:
         logger.info("🚀 Starting MAX → Telegram Forwarder...")
