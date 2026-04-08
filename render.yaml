@@ -17,5 +17,7 @@ services:
         value: "https://platform-api.max.ru"
       - key: POLL_INTERVAL
         value: "1"
+      - key: MAX_RETRIES
+        value: "1"
       - key: PYTHONUNBUFFERED
         value: "1"
