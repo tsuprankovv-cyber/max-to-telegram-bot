@@ -2,7 +2,9 @@ services:
   - type: web
     name: max-to-telegram-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
     startCommand: bash start.sh
     envVars:
       - key: TELEGRAM_BOT_TOKEN
@@ -21,3 +23,13 @@ services:
         value: "1"
       - key: DEBUG_IGNORE_SEQ
         value: "0"
+      - key: LOG_LEVEL
+        value: "DEBUG"
+      - key: LOG_RAW_MAX
+        value: "1"
+      - key: LOG_RAW_TG
+        value: "1"
+      - key: LOG_MARKUP
+        value: "1"
+      - key: LOG_MEDIA
+        value: "1"
