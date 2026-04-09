@@ -2,6 +2,7 @@ services:
   - type: web
     name: max-to-telegram-bot
     env: python
+    runtime: python312
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
       pip install -r requirements.txt
