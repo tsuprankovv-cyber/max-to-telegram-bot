@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ПОЛНАЯ ВЕРСИЯ С РАСШИРЕННОЙ ПОДДЕРЖКОЙ ФОРМАТИРОВАНИЯ, МЕДИА И ЛОГИРОВАНИЯ
+ИСПРАВЛЕННАЯ ВЕРСИЯ: форматирование, документы, голосовые, аудио
 """
 import os
 import sys
@@ -12,17 +12,12 @@ import time
 import re
 import tempfile
 import subprocess
-import struct
 from typing import List, Dict, Optional, Any, Tuple, Union
-from collections import deque
 from io import BytesIO
 
 import aiohttp
 from aiohttp import web
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3
-from mutagen.mp3 import MP3
-from mutagen.mp4 import MP4
 
 # ===================================================================
 # 1. НАСТРОЙКА ЛОГИРОВАНИЯ
@@ -58,33 +53,22 @@ DEBUG_IGNORE_SEQ = os.getenv('DEBUG_IGNORE_SEQ', '0') == '1'
 _last_processed_seq = 0
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FULL VERSION]")
-logger.info("=" * 100)
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FIXED VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
-logger.info(f"🔗 MAX API Base: {MAX_BASE}")
 logger.info(f"⏱️  Poll Interval: {POLL_SEC}s")
-logger.info(f"📊 LOG_LEVEL: {LOG_LEVEL}")
-logger.info(f"📊 LOG_RAW_MAX: {LOG_RAW_MAX}")
-logger.info(f"📊 LOG_RAW_TG: {LOG_RAW_TG}")
-logger.info(f"📊 LOG_MARKUP: {LOG_MARKUP}")
-logger.info(f"📊 LOG_MEDIA: {LOG_MEDIA}")
 logger.info("=" * 100)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
     logger.critical("❌ FATAL: Missing required environment variables!")
     sys.exit(1)
 
-logger.info("✅ All environment variables present")
-
 # ===================================================================
-# 3. УТИЛИТЫ ДЛЯ ГРАФЕМ И РАЗМЕТКИ
+# 3. ГРАФЕМЫ И РАЗМЕТКА
 # ===================================================================
 def split_into_graphemes(text: str) -> List[str]:
-    """Разбивает текст на графемы для корректной работы с эмодзи."""
     if not text:
         return []
-    
     graphemes = []
     i = 0
     while i < len(text):
@@ -107,75 +91,42 @@ def split_into_graphemes(text: str) -> List[str]:
         else:
             graphemes.append(char)
             i += 1
-    
     return graphemes
 
 
 def find_markup_in_message(msg: Dict) -> Tuple[List[Dict], str]:
-    """
-    Ищет разметку во всех возможных полях сообщения MAX.
-    Возвращает (markup_list, source_field).
-    """
     possible_fields = ['markup', 'entities', 'formats', 'styles', 'annotations', 'text_entities']
     
     body = msg.get('body', {})
     if isinstance(body, dict):
         for field in possible_fields:
             if field in body and body[field]:
-                logger.info(f"[MARKUP-DETECT] Found markup in body.{field}")
+                logger.info(f"[MARKUP] Found in body.{field}")
                 if LOG_MARKUP:
-                    logger.debug(f"[MARKUP-RAW] body.{field}: {json.dumps(body[field], ensure_ascii=False, indent=2)[:1000]}")
+                    logger.debug(f"[MARKUP-RAW] {json.dumps(body[field], ensure_ascii=False)[:500]}")
                 return body[field], f"body.{field}"
     
     for field in possible_fields:
         if field in msg and msg[field]:
-            logger.info(f"[MARKUP-DETECT] Found markup in root.{field}")
-            if LOG_MARKUP:
-                logger.debug(f"[MARKUP-RAW] root.{field}: {json.dumps(msg[field], ensure_ascii=False, indent=2)[:1000]}")
+            logger.info(f"[MARKUP] Found in root.{field}")
             return msg[field], f"root.{field}"
     
-    link = msg.get('link', {})
-    if isinstance(link, dict) and 'message' in link:
-        inner = link['message']
-        if isinstance(inner, dict):
-            inner_body = inner.get('body', {})
-            if isinstance(inner_body, dict):
-                for field in possible_fields:
-                    if field in inner_body and inner_body[field]:
-                        logger.info(f"[MARKUP-DETECT] Found markup in link.message.body.{field}")
-                        return inner_body[field], f"link.message.body.{field}"
-            for field in possible_fields:
-                if field in inner and inner[field]:
-                    logger.info(f"[MARKUP-DETECT] Found markup in link.message.{field}")
-                    return inner[field], f"link.message.{field}"
-    
-    logger.info("[MARKUP-DETECT] No markup found in message")
     return [], "none"
 
 
 def apply_markup(text: str, markup: List[Dict]) -> str:
-    """
-    Конвертирует разметку MAX в HTML для Telegram.
-    """
     if not markup or not text:
         return text
     
-    logger.info(f"[MARKUP] Converting: text_len={len(text)}, markup_items={len(markup)}")
+    logger.info(f"[MARKUP] Converting: text_len={len(text)}, items={len(markup)}")
     
     TAGS = {
-        "strong": ("<b>", "</b>"),
-        "bold": ("<b>", "</b>"),
-        "italic": ("<i>", "</i>"),
-        "em": ("<i>", "</i>"),
-        "code": ("<code>", "</code>"),
-        "inline-code": ("<code>", "</code>"),
-        "pre": ("<pre>", "</pre>"),
-        "preformatted": ("<pre>", "</pre>"),
-        "underline": ("<u>", "</u>"),
-        "u": ("<u>", "</u>"),
-        "strikethrough": ("<s>", "</s>"),
-        "strike": ("<s>", "</s>"),
-        "s": ("<s>", "</s>"),
+        "strong": ("<b>", "</b>"), "bold": ("<b>", "</b>"),
+        "italic": ("<i>", "</i>"), "em": ("<i>", "</i>"),
+        "code": ("<code>", "</code>"), "inline-code": ("<code>", "</code>"),
+        "pre": ("<pre>", "</pre>"), "preformatted": ("<pre>", "</pre>"),
+        "underline": ("<u>", "</u>"), "u": ("<u>", "</u>"),
+        "strikethrough": ("<s>", "</s>"), "strike": ("<s>", "</s>"), "s": ("<s>", "</s>"),
         "spoiler": ("<tg-spoiler>", "</tg-spoiler>"),
     }
     
@@ -191,15 +142,12 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
             end = start + length
             
             if start < 0 or end > n or length <= 0:
-                logger.warning(f"[MARKUP] Invalid range: item={idx}, start={start}, length={length}, end={end}, n={n}")
                 continue
             
             if mtype in TAGS:
                 open_tag, close_tag = TAGS[mtype]
                 events.append((start, 'open', open_tag, idx))
                 events.append((end, 'close', close_tag, idx))
-                if LOG_MARKUP:
-                    logger.debug(f"[MARKUP] Item {idx}: {mtype} [{start}:{end}]")
             elif mtype in ("link", "text_link", "url"):
                 url = m.get("url") or m.get("href") or ""
                 if url:
@@ -208,16 +156,8 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                     close_tag = "</a>"
                     events.append((start, 'open', open_tag, idx))
                     events.append((end, 'close', close_tag, idx))
-                    if LOG_MARKUP:
-                        logger.debug(f"[MARKUP] Item {idx}: link [{start}:{end}] -> {url[:50]}")
-            elif mtype in ("mention", "hashtag", "bot_command", "cashtag", "email"):
-                if LOG_MARKUP:
-                    logger.debug(f"[MARKUP] Item {idx}: {mtype} (skipped, native TG support)")
-                continue
-            else:
-                logger.warning(f"[MARKUP] Unknown type: '{mtype}' in item {idx}")
         except Exception as e:
-            logger.error(f"[MARKUP] Error processing item {idx}: {e}", exc_info=True)
+            logger.error(f"[MARKUP] Error: {e}")
     
     events.sort(key=lambda x: (x[0], 0 if x[1] == 'close' else 1, -x[3]))
     
@@ -244,72 +184,51 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     for tag_close, _ in reversed(active_tags):
         result.append(tag_close)
     
-    final_text = "".join(result)
-    logger.info(f"[MARKUP] Conversion complete: output_len={len(final_text)}")
-    if LOG_MARKUP:
-        logger.debug(f"[MARKUP] Output preview: {final_text[:200]}")
+    return "".join(result)
+
+
+# ===================================================================
+# 4. ФОРВАРДЫ (без префикса)
+# ===================================================================
+def extract_forward_info(msg: Dict, depth: int = 0, visited_ids: set = None) -> Optional[Dict]:
+    if visited_ids is None:
+        visited_ids = set()
     
-    return final_text
-
-
-# ===================================================================
-# 4. ДЕТЕКЦИЯ ФОРВАРДОВ
-# ===================================================================
-def extract_forward_info(msg: Dict, depth: int = 0) -> Optional[Dict]:
-    """Извлекает информацию о пересланном сообщении."""
-    if depth > 5:
-        logger.warning(f"[FWD] Max recursion depth reached")
+    if depth > 10:
         return None
     
-    fwd_fields = ['link', 'forward', 'fwd', 'forwarded_message', 'reply_to', 'quoted_message']
+    msg_id = msg.get('mid') or msg.get('id')
+    if msg_id and msg_id in visited_ids:
+        return None
+    if msg_id:
+        visited_ids.add(msg_id)
+    
+    fwd_fields = ['link', 'forward', 'fwd', 'forwarded_message', 'reply_to']
     
     for field in fwd_fields:
         if field in msg and msg[field]:
-            logger.info(f"[FWD-DETECT] Found forward in field: {field}")
             fwd_data = msg[field]
-            
-            if LOG_RAW_MAX:
-                logger.debug(f"[FWD-RAW] {field}: {json.dumps(fwd_data, ensure_ascii=False)[:500]}")
+            logger.info(f"[FWD] Found in {field}")
             
             if isinstance(fwd_data, dict) and 'message' in fwd_data:
                 inner = fwd_data['message']
-                logger.info(f"[FWD] Extracting from link.message")
                 return {
-                    "source_field": field,
                     "message": inner,
-                    "original_chat_id": fwd_data.get('chat_id'),
-                    "original_message_id": fwd_data.get('message_id') or inner.get('id')
+                    "original_chat_id": fwd_data.get('chat_id')
                 }
             
-            if isinstance(fwd_data, dict) and ('text' in fwd_data or 'body' in fwd_data or 'attachments' in fwd_data):
-                logger.info(f"[FWD] Forward is direct message dict")
-                return {
-                    "source_field": field,
-                    "message": fwd_data,
-                    "original_chat_id": fwd_data.get('chat_id'),
-                    "original_message_id": fwd_data.get('id')
-                }
-            
-            if isinstance(fwd_data, str):
-                logger.info(f"[FWD] Forward is message ID string: {fwd_data}")
-                return {
-                    "source_field": field,
-                    "message_id": fwd_data,
-                    "type": "reference"
-                }
+            if isinstance(fwd_data, dict) and ('text' in fwd_data or 'body' in fwd_data):
+                return {"message": fwd_data}
     
     body = msg.get('body', {})
     if isinstance(body, dict):
-        result = extract_forward_info(body, depth + 1)
-        if result:
-            return result
+        return extract_forward_info(body, depth + 1, visited_ids)
     
-    logger.info(f"[FWD-DETECT] No forward found")
     return None
 
 
 # ===================================================================
-# 5. ИЗВЛЕЧЕНИЕ ДАННЫХ ИЗ СООБЩЕНИЯ
+# 5. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def safe_list(val: Any) -> List[Dict]:
     if val is None:
@@ -317,7 +236,7 @@ def safe_list(val: Any) -> List[Dict]:
     if isinstance(val, list):
         return [v for v in val if isinstance(v, dict)]
     if isinstance(val, dict):
-        for k in ['messages', 'items', 'data', 'result', 'message', 'attachments', 'files', 'media']:
+        for k in ['attachments', 'files', 'media']:
             if k in val:
                 v = val[k]
                 return v if isinstance(v, list) else [v] if isinstance(v, dict) else []
@@ -325,211 +244,142 @@ def safe_list(val: Any) -> List[Dict]:
 
 
 def extract_data(msg: Dict) -> Dict:
-    logger.info(f"[EXTRACT] Starting data extraction")
-    
     fwd = extract_forward_info(msg)
     if fwd and fwd.get('message'):
-        logger.info(f"[EXTRACT] Processing forwarded message")
         inner = fwd['message']
-        
-        body = inner.get('body', {}) if isinstance(inner, dict) else {}
-        markup, markup_source = find_markup_in_message(inner)
+        body = inner.get('body', {})
+        markup, _ = find_markup_in_message(inner)
         
         return {
-            "source": f"forward.{fwd['source_field']}",
-            "mid": inner.get('mid') or inner.get('id') or fwd.get('original_message_id'),
+            "source": "forward",
+            "mid": inner.get('mid') or inner.get('id'),
             "seq": inner.get('seq') or body.get('seq'),
             "text": inner.get('text', '') or body.get('text', ''),
             "markup": markup,
-            "markup_source": markup_source,
-            "attachments": safe_list(
-                inner.get('attachments') or 
-                body.get('attachments') or 
-                inner.get('files') or 
-                inner.get('media')
-            ),
-            "is_forward": True,
-            "forward_info": {
-                "chat_id": fwd.get('original_chat_id'),
-                "message_id": fwd.get('original_message_id')
-            }
+            "attachments": safe_list(inner.get('attachments') or body.get('attachments')),
+            "is_forward": True
         }
     
     body = msg.get('body', {})
-    markup, markup_source = find_markup_in_message(msg)
+    markup, _ = find_markup_in_message(msg)
     
-    if isinstance(body, dict) and ('text' in body or 'attachments' in body):
-        logger.info(f"[EXTRACT] Using body")
+    if isinstance(body, dict):
         return {
             "source": "body",
-            "mid": body.get('mid') or msg.get('mid'),
-            "seq": body.get('seq') or msg.get('seq'),
+            "mid": body.get('mid'),
+            "seq": body.get('seq'),
             "text": body.get('text', ''),
             "markup": markup,
-            "markup_source": markup_source,
-            "attachments": safe_list(
-                body.get('attachments') or 
-                body.get('files') or 
-                body.get('media')
-            ),
+            "attachments": safe_list(body.get('attachments')),
             "is_forward": False
         }
     
-    logger.info(f"[EXTRACT] Using root")
     return {
         "source": "root",
-        "mid": msg.get('id') or msg.get('message_id') or msg.get('mid'),
+        "mid": msg.get('mid'),
         "seq": msg.get('seq'),
         "text": msg.get('text', ''),
         "markup": markup,
-        "markup_source": markup_source,
-        "attachments": safe_list(
-            msg.get('attachments') or 
-            msg.get('files') or 
-            msg.get('media')
-        ),
+        "attachments": safe_list(msg.get('attachments')),
         "is_forward": False
     }
 
 
 # ===================================================================
-# 6. УТИЛИТЫ ДЛЯ АУДИО (БЕЗ PYDUB)
+# 6. АУДИО УТИЛИТЫ
 # ===================================================================
-def get_audio_duration_ffprobe(file_path: str) -> int:
-    """Получает длительность аудио через ffprobe."""
+def get_audio_duration(file_path: str) -> int:
     try:
-        cmd = [
-            'ffprobe', '-v', 'error', '-show_entries',
-            'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1',
-            file_path
-        ]
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+               '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode == 0:
             return int(float(result.stdout.strip()))
-    except Exception as e:
-        logger.debug(f"[AUDIO] ffprobe failed: {e}")
+    except:
+        pass
     return 0
 
 
 def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
-    """Извлекает метаданные аудиофайла."""
     performer = ''
     title = ''
     duration = 0
     
-    # Сохраняем во временный файл для анализа
     with tempfile.NamedTemporaryFile(suffix='.tmp', delete=False) as tmp:
         tmp.write(file_data)
         tmp_path = tmp.name
     
     try:
-        # Пробуем mutagen
-        audio_file = MutagenFile(tmp_path)
-        if audio_file is not None:
-            # Длительность
-            if hasattr(audio_file, 'info') and hasattr(audio_file.info, 'length'):
-                duration = int(audio_file.info.length)
-            
-            # Теги
-            if hasattr(audio_file, 'tags'):
-                tags = audio_file.tags
+        audio = MutagenFile(tmp_path)
+        if audio:
+            if hasattr(audio, 'info') and hasattr(audio.info, 'length'):
+                duration = int(audio.info.length)
+            if hasattr(audio, 'tags'):
+                tags = audio.tags
                 if tags:
-                    # ID3
                     if 'TPE1' in tags:
                         performer = str(tags['TPE1'])
                     elif '©ART' in tags:
                         performer = str(tags['©ART'])
-                    
                     if 'TIT2' in tags:
                         title = str(tags['TIT2'])
                     elif '©nam' in tags:
                         title = str(tags['©nam'])
-            elif hasattr(audio_file, 'get'):
-                performer = str(audio_file.get('artist', [''])[0]) if audio_file.get('artist') else ''
-                title = str(audio_file.get('title', [''])[0]) if audio_file.get('title') else ''
-        
-        # Fallback: ffprobe для длительности
-        if duration == 0:
-            duration = get_audio_duration_ffprobe(tmp_path)
-        
-    except Exception as e:
-        logger.debug(f"[AUDIO] Mutagen failed: {e}")
-        duration = get_audio_duration_ffprobe(tmp_path)
+    except:
+        pass
     finally:
         os.unlink(tmp_path)
     
-    # Fallback: парсим имя файла
-    if not performer or not title:
-        name_without_ext = filename.rsplit('.', 1)[0] if '.' in filename else filename
-        if ' - ' in name_without_ext:
-            parts = name_without_ext.split(' - ', 1)
-            performer = performer or parts[0].strip()
-            title = title or parts[1].strip()
-        else:
-            title = title or name_without_ext.strip()
-            performer = performer or 'Unknown Artist'
+    if duration == 0:
+        duration = get_audio_duration(tmp_path) if os.path.exists(tmp_path) else 0
     
-    performer = performer or 'Unknown Artist'
-    title = title or filename or 'Unknown Track'
+    # Fallback: имя файла
+    name = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    if ' - ' in name:
+        parts = name.split(' - ', 1)
+        performer = performer or parts[0].strip()
+        title = title or parts[1].strip()
+    else:
+        title = title or name.strip()
+        performer = performer or 'Unknown'
     
-    logger.info(f"[AUDIO] Tags: performer='{performer}', title='{title}', duration={duration}s")
-    
-    return {
-        'performer': performer[:64],
-        'title': title[:64],
-        'duration': duration
-    }
+    logger.info(f"[AUDIO] Tags: {performer} - {title} ({duration}s)")
+    return {'performer': performer[:64], 'title': title[:64], 'duration': duration}
 
 
-def convert_to_voice_ogg(audio_data: bytes, original_name: str) -> Optional[bytes]:
-    """Конвертирует аудио в OGG Opus для голосовых сообщений."""
-    # Проверяем наличие ffmpeg
+def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     try:
         subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-    except (subprocess.SubprocessError, FileNotFoundError):
-        logger.warning("[VOICE] FFmpeg not available")
+    except:
         return None
     
     try:
         with tempfile.NamedTemporaryFile(suffix='.tmp', delete=False) as tmp_in:
-            tmp_in.write(audio_data)
+            tmp_in.write(file_data)
             tmp_in_path = tmp_in.name
         
         with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp_out:
             tmp_out_path = tmp_out.name
         
-        cmd = [
-            'ffmpeg', '-i', tmp_in_path,
-            '-ac', '1',
-            '-ar', '16000',
-            '-c:a', 'libopus',
-            '-b:a', '16k',
-            '-vbr', 'on',
-            '-application', 'voip',
-            '-y',
-            tmp_out_path
-        ]
+        cmd = ['ffmpeg', '-i', tmp_in_path, '-ac', '1', '-ar', '16000',
+               '-c:a', 'libopus', '-b:a', '16k', '-vbr', 'on',
+               '-application', 'voip', '-y', tmp_out_path]
         
-        logger.info(f"[VOICE] Converting: {original_name}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
         
         if result.returncode != 0:
-            logger.error(f"[VOICE] FFmpeg error: {result.stderr[:500]}")
             os.unlink(tmp_in_path)
             return None
         
         with open(tmp_out_path, 'rb') as f:
             ogg_data = f.read()
         
-        logger.info(f"[VOICE] Conversion success: {len(audio_data)} -> {len(ogg_data)} bytes")
-        
         os.unlink(tmp_in_path)
         os.unlink(tmp_out_path)
         
+        logger.info(f"[VOICE] Converted: {len(file_data)} -> {len(ogg_data)} bytes")
         return ogg_data
-        
-    except Exception as e:
-        logger.error(f"[VOICE] Conversion error: {e}", exc_info=True)
+    except:
         return None
 
 
@@ -537,68 +387,54 @@ def convert_to_voice_ogg(audio_data: bytes, original_name: str) -> Optional[byte
 # 7. MEDIA PROCESSOR
 # ===================================================================
 class MediaProcessor:
-    PHOTO_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif'}
-    VIDEO_EXTS = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'flv', 'm4v', '3gp'}
-    AUDIO_EXTS = {'mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg', 'opus', 'wma'}
-    VOICE_EXTS = {'ogg', 'opus', 'oga'}
+    PHOTO_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'}
+    VIDEO_EXTS = {'mp4', 'mov', 'avi', 'mkv', 'webm'}
+    AUDIO_EXTS = {'mp3', 'wav', 'm4a', 'flac', 'aac', 'ogg', 'opus'}
     
     def __init__(self):
-        self.ffmpeg_available = self._check_ffmpeg()
-        logger.info(f"[MEDIA] FFmpeg available: {self.ffmpeg_available}")
+        self.ffmpeg_ok = self._check_ffmpeg()
+        logger.info(f"[MEDIA] FFmpeg: {self.ffmpeg_ok}")
     
-    def _check_ffmpeg(self) -> bool:
+    def _check_ffmpeg(self):
         try:
             subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
             return True
         except:
             return False
     
-    def determine_type(self, att: Dict) -> Tuple[str, Dict]:
+    def determine(self, att: Dict) -> Tuple[str, Dict]:
         atype = att.get('type') or att.get('media_type') or 'file'
-        payload = att.get('payload', {}) if isinstance(att.get('payload'), dict) else {}
+        payload = att.get('payload', {})
         
-        fname = payload.get('filename') or att.get('filename') or att.get('name') or ''
+        fname = payload.get('filename') or att.get('filename') or ''
         size = payload.get('size') or att.get('size') or 0
-        url = payload.get('url') or att.get('url')
-        token = payload.get('token') or att.get('token') or att.get('file_token')
-        
+        url = payload.get('url')
+        token = payload.get('token') or att.get('token')
         ext = fname.split('.')[-1].lower() if '.' in fname else ''
         
-        logger.info(f"[MEDIA] Determine: atype={atype}, ext={ext}, size={size}")
+        logger.info(f"[MEDIA] atype={atype}, ext={ext}, size={size}")
         
-        metadata = {
-            'filename': fname,
-            'size': size,
-            'url': url,
-            'token': token,
-            'ext': ext,
-            'original_type': atype
-        }
+        meta = {'filename': fname, 'size': size, 'url': url, 'token': token, 'ext': ext}
         
-        if ext in self.PHOTO_EXTS:
-            return 'photo', metadata
-        if ext in self.VIDEO_EXTS:
-            return 'video', metadata
-        if ext in self.VOICE_EXTS:
-            return 'voice', metadata
-        if ext in self.AUDIO_EXTS:
-            if size < 2 * 1024 * 1024 and self.ffmpeg_available:
-                logger.info(f"[MEDIA] Small audio, will try voice conversion")
-                return 'voice', metadata
-            return 'audio', metadata
-        
-        if atype in ('image', 'photo', 'picture'):
-            return 'photo', metadata
-        if atype == 'video':
-            return 'video', metadata
+        # ЯВНЫЕ ТИПЫ ОТ MAX
         if atype == 'voice':
-            return 'voice', metadata
+            return 'voice', meta
         if atype == 'audio':
-            if size < 2 * 1024 * 1024 and self.ffmpeg_available:
-                return 'voice', metadata
-            return 'audio', metadata
+            return 'audio', meta
+        if atype == 'video':
+            return 'video', meta
+        if atype in ('image', 'photo'):
+            return 'photo', meta
         
-        return 'document', metadata
+        # ПО РАСШИРЕНИЮ
+        if ext in self.PHOTO_EXTS:
+            return 'photo', meta
+        if ext in self.VIDEO_EXTS:
+            return 'video', meta
+        if ext in self.AUDIO_EXTS:
+            return 'audio', meta
+        
+        return 'document', meta
 
 
 # ===================================================================
@@ -610,107 +446,69 @@ class TG:
         self.chat_id = chat_id
         self.base = f"https://api.telegram.org/bot{token}"
         self.session = None
-        self.MAX_BYTES = 50 * 1024 * 1024
-        logger.info(f"[TG] Initialized: chat_id={chat_id}")
     
     async def init(self):
-        if not self.session or self.session.closed:
+        if not self.session:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
     
     async def send(self, method: str, **kw) -> Optional[Dict]:
         await self.init()
-        start_time = time.time()
-        logger.info(f"[TG] ▶️ {method}")
-        
-        if LOG_RAW_TG:
-            logger.debug(f"[TG-REQ] {json.dumps(kw, default=str, ensure_ascii=False)[:500]}")
+        logger.info(f"[TG] {method}")
         
         try:
             async with self.session.post(f"{self.base}/{method}", **kw) as r:
-                elapsed_ms = (time.time() - start_time) * 1000
                 txt = await r.text()
                 
-                logger.info(f"[TG] Status: {r.status} | Time: {elapsed_ms:.0f}ms")
-                
                 if LOG_RAW_TG:
-                    logger.info(f"[TG-RESP] {txt}")
+                    logger.info(f"[TG-RESP] {txt[:500]}")
                 
                 try:
-                    resp_json = json.loads(txt)
+                    resp = json.loads(txt)
                 except:
-                    logger.error(f"[TG] Invalid JSON: {txt[:300]}")
                     return None
                 
-                if r.status == 200 and resp_json.get('ok'):
-                    result = resp_json.get('result', {})
-                    msg_id = result.get('message_id')
-                    logger.info(f"[TG] ✅ Success: message_id={msg_id}")
-                    return resp_json
-                
+                if r.status == 200 and resp.get('ok'):
+                    logger.info(f"[TG] ✅ message_id={resp.get('result', {}).get('message_id')}")
+                    return resp
                 elif r.status == 429:
-                    retry_after = resp_json.get('parameters', {}).get('retry_after', 10)
-                    logger.warning(f"[TG] Rate limit, waiting {retry_after}s")
-                    await asyncio.sleep(retry_after)
+                    wait = resp.get('parameters', {}).get('retry_after', 10)
+                    logger.warning(f"[TG] Rate limit, wait {wait}s")
+                    await asyncio.sleep(wait)
                     return await self.send(method, **kw)
-                
                 else:
-                    error_code = resp_json.get('error_code')
-                    description = resp_json.get('description')
-                    logger.error(f"[TG] ❌ Error {error_code}: {description}")
-                    return resp_json
-                    
+                    logger.error(f"[TG] ❌ {resp.get('description')}")
+                    return resp
         except Exception as e:
-            logger.error(f"[TG] Exception: {e}", exc_info=True)
+            logger.error(f"[TG] Exception: {e}")
             return None
     
     async def text(self, text: str) -> bool:
         if not text or not text.strip():
             return True
-        
-        logger.info(f"[TG] Sending text: len={len(text)}")
         resp = await self.send('sendMessage', json={
-            'chat_id': self.chat_id,
-            'text': text,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': False
+            'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML'
         })
-        return resp is not None and resp.get('ok', False)
+        return resp and resp.get('ok', False)
     
-    async def media(self, type_: str, media_data: Union[str, bytes], 
-                    caption: str = "", filename: str = None, 
-                    is_url: bool = False, **extra) -> bool:
-        logger.info(f"[TG] Sending {type_}: is_url={is_url}")
+    async def media(self, type_: str, data: Union[str, bytes],
+                    caption: str = "", filename: str = "", **extra) -> bool:
         
-        if isinstance(media_data, bytes):
-            size_mb = len(media_data) / 1024 / 1024
-            if size_mb > 50:
-                logger.warning(f"[TG] File too large: {size_mb:.2f} MB")
-                return False
-        
-        await self.init()
-        
-        method_map = {
-            'photo': 'sendPhoto',
-            'video': 'sendVideo',
-            'audio': 'sendAudio',
-            'voice': 'sendVoice',
-            'document': 'sendDocument'
-        }
+        method_map = {'photo': 'sendPhoto', 'video': 'sendVideo',
+                      'audio': 'sendAudio', 'voice': 'sendVoice',
+                      'document': 'sendDocument'}
         method = method_map.get(type_, 'sendDocument')
+        field = type_ if type_ != 'document' else 'document'
         
         form = aiohttp.FormData()
         form.add_field('chat_id', self.chat_id)
         
-        field_map = {'photo': 'photo', 'video': 'video', 'audio': 'audio', 'voice': 'voice', 'document': 'document'}
-        tg_field = field_map.get(type_, 'document')
-        
-        if is_url:
-            form.add_field(tg_field, media_data)
+        if isinstance(data, str):
+            form.add_field(field, data)
         else:
-            fname = filename or f"{type_}_file"
-            form.add_field(tg_field, media_data, filename=fname)
+            fname = filename or f"{type_}.file"
+            form.add_field(field, data, filename=fname)
         
-        if caption:
+        if caption and type_ != 'document':
             form.add_field('caption', caption[:1024])
             form.add_field('parse_mode', 'HTML')
         
@@ -726,36 +524,7 @@ class TG:
             form.add_field('duration', str(extra['duration']))
         
         resp = await self.send(method, data=form)
-        return resp is not None and resp.get('ok', False)
-    
-    async def media_group(self, media_items: List[Dict]) -> bool:
-        if not media_items:
-            return True
-        
-        if len(media_items) > 10:
-            logger.warning(f"[TG] Media group too large: {len(media_items)}, splitting")
-            for i in range(0, len(media_items), 10):
-                chunk = media_items[i:i+10]
-                await self.media_group(chunk)
-                await asyncio.sleep(0.5)
-            return True
-        
-        logger.info(f"[TG] Sending media group: {len(media_items)} items")
-        await self.init()
-        
-        input_media = []
-        for item in media_items:
-            media_obj = {'type': item['type'], 'media': item['media']}
-            if item.get('caption'):
-                media_obj['caption'] = item['caption'][:1024]
-                media_obj['parse_mode'] = 'HTML'
-            input_media.append(media_obj)
-        
-        resp = await self.send('sendMediaGroup', json={
-            'chat_id': self.chat_id,
-            'media': input_media
-        })
-        return resp is not None and resp.get('ok', False)
+        return resp and resp.get('ok', False)
 
 
 # ===================================================================
@@ -767,248 +536,166 @@ class MX:
         self.cid = cid
         self.base = base
         self.session = None
-        logger.info(f"[MAX] Initialized: cid={cid}")
     
     async def init(self):
-        if not self.session or self.session.closed:
+        if not self.session:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     
     async def fetch(self, limit: int = 50) -> List[Dict]:
         await self.init()
         try:
-            params = {'chat_id': self.cid, 'limit': limit}
-            logger.debug(f"[MAX] Fetching: limit={limit}")
-            
             async with self.session.get(
                 f"{self.base}/messages",
                 headers={'Authorization': self.token},
-                params=params
+                params={'chat_id': self.cid, 'limit': limit}
             ) as r:
                 if r.status == 200:
                     raw = await r.json()
-                    if LOG_RAW_MAX:
-                        logger.debug(f"[MAX-RESP] {json.dumps(raw, ensure_ascii=False)[:1000]}")
-                    msgs = raw.get('messages', raw) if isinstance(raw, dict) else raw
-                    logger.info(f"[MAX] Got {len(msgs) if isinstance(msgs, list) else 0} messages")
-                    return msgs if isinstance(msgs, list) else []
-                logger.error(f"[MAX] HTTP {r.status}")
+                    msgs = raw.get('messages', [])
+                    logger.info(f"[MAX] Got {len(msgs)} messages")
+                    return msgs
                 return []
-        except Exception as e:
-            logger.error(f"[MAX] Exception: {e}", exc_info=True)
+        except:
             return []
     
     async def download(self, token: str) -> Optional[bytes]:
         await self.init()
-        logger.info(f"[MAX] Downloading: token={token[:30]}...")
         try:
             async with self.session.get(
                 f"{self.base}/files/{token}/download",
                 headers={'Authorization': self.token}
             ) as r:
                 if r.status == 200:
-                    data = await r.read()
-                    logger.info(f"[MAX] Downloaded: {len(data)} bytes")
-                    return data
-                err = await r.text()
-                logger.error(f"[MAX] Download failed: HTTP {r.status} - {err[:200]}")
+                    return await r.read()
                 return None
-        except Exception as e:
-            logger.error(f"[MAX] Download exception: {e}")
+        except:
             return None
 
 
 # ===================================================================
-# 10. ОБРАБОТЧИК СООБЩЕНИЙ
+# 10. ОБРАБОТЧИК
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
-media_processor = MediaProcessor()
+media_proc = MediaProcessor()
 
 
-def extract_seq_from_msg(msg: Dict) -> int:
+def extract_seq(msg: Dict) -> int:
     body = msg.get('body', {})
-    if isinstance(body, dict) and 'seq' in body:
-        return int(body['seq'])
-    if 'seq' in msg:
-        return int(msg['seq'])
-    return 0
+    return int(body.get('seq', 0) or msg.get('seq', 0))
 
 
 async def process_attachment(att: Dict, caption: str = "") -> bool:
-    logger.info(f"[ATT] Processing: {json.dumps(att, ensure_ascii=False)[:300]}")
-    
-    if not isinstance(att, dict):
-        logger.warning("[ATT] Not a dict, skipping")
-        return False
-    
-    tg_type, meta = media_processor.determine_type(att)
-    logger.info(f"[ATT] Determined type: {tg_type}")
+    tg_type, meta = media_proc.determine(att)
+    logger.info(f"[ATT] Type: {tg_type}")
     
     file_data = None
     is_url = False
-    media_input = None
     
-    if meta.get('url'):
-        media_input = meta['url']
-        is_url = True
-        logger.info(f"[ATT] Using URL")
+    # Документы и аудио ВСЕГДА скачиваем через токен
+    if tg_type in ('document', 'audio', 'voice') and meta.get('token'):
+        file_data = await mx.download(meta['token'])
+        if not file_data:
+            return False
+    elif meta.get('url'):
+        # URL только для фото/видео
+        return await tg.media(tg_type, meta['url'], caption=caption, is_url=True)
     elif meta.get('token'):
         file_data = await mx.download(meta['token'])
-        if file_data:
-            media_input = file_data
-            is_url = False
-        else:
-            logger.error("[ATT] Download failed")
+        if not file_data:
             return False
     else:
-        logger.warning("[ATT] No URL or token")
         return False
     
     extra = {}
-    if tg_type == 'voice' and not is_url and file_data:
-        if meta['ext'] not in media_processor.VOICE_EXTS:
-            logger.info(f"[ATT] Converting to voice...")
-            voice_data = convert_to_voice_ogg(file_data, meta['filename'])
-            if voice_data:
-                media_input = voice_data
-                with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
-                    tmp.write(voice_data)
-                    tmp_path = tmp.name
-                extra['duration'] = get_audio_duration_ffprobe(tmp_path)
-                os.unlink(tmp_path)
-            else:
-                tg_type = 'audio'
-                logger.warning("[ATT] Conversion failed, sending as audio")
     
-    if tg_type == 'audio' and not is_url and file_data:
-        tags = extract_audio_tags(file_data, meta['filename'])
-        extra.update(tags)
+    # Конвертация mp3 → голосовое (если маленький файл)
+    if tg_type == 'audio' and meta['size'] < 2 * 1024 * 1024 and media_proc.ffmpeg_ok:
+        logger.info(f"[ATT] Trying voice conversion...")
+        voice_data = convert_to_voice(file_data)
+        if voice_data:
+            tg_type = 'voice'
+            file_data = voice_data
+            # Получаем длительность
+            with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
+                tmp.write(voice_data)
+                tmp_path = tmp.name
+            extra['duration'] = get_audio_duration(tmp_path)
+            os.unlink(tmp_path)
     
-    success = await tg.media(
-        tg_type,
-        media_input,
-        caption=caption if tg_type != 'document' else '',
-        filename=meta['filename'],
-        is_url=is_url,
-        **extra
-    )
+    # Теги для аудио
+    if tg_type == 'audio':
+        extra.update(extract_audio_tags(file_data, meta['filename']))
     
-    logger.info(f"[ATT] Send result: {'OK' if success else 'FAIL'}")
-    return success
+    return await tg.media(tg_type, file_data, caption=caption,
+                          filename=meta['filename'], **extra)
 
 
 async def handle_message(msg: Dict):
     global _last_processed_seq
     
     logger.info("=" * 60)
-    logger.info("[HANDLE] Processing message")
     
-    if LOG_RAW_MAX:
-        logger.debug(f"[HANDLE] Raw: {json.dumps(msg, ensure_ascii=False)[:1500]}")
-    
-    seq = extract_seq_from_msg(msg)
-    mid = msg.get('body', {}).get('mid') or msg.get('mid', 'unknown')
-    
-    logger.info(f"[HANDLE] mid={mid}, seq={seq}, last_seq={_last_processed_seq}")
+    seq = extract_seq(msg)
+    logger.info(f"[HANDLE] seq={seq}, last={_last_processed_seq}")
     
     if seq and seq <= _last_processed_seq and not DEBUG_IGNORE_SEQ:
-        logger.info(f"[HANDLE] ⏭ Skipping duplicate: seq={seq} <= {_last_processed_seq}")
+        logger.info("[HANDLE] ⏭ Skipping (duplicate)")
         return
     
     data = extract_data(msg)
-    
-    logger.info(f"[HANDLE] Extracted: source={data['source']}, text_len={len(data['text'])}, attachments={len(data['attachments'])}")
-    logger.info(f"[HANDLE] Markup source: {data.get('markup_source', 'none')}, items={len(data['markup'])}")
-    logger.info(f"[HANDLE] Is forward: {data['is_forward']}")
+    logger.info(f"[HANDLE] text_len={len(data['text'])}, att={len(data['attachments'])}")
     
     text = data['text']
     if data['markup']:
         text = apply_markup(text, data['markup'])
-        logger.info(f"[HANDLE] Markup applied, result_len={len(text)}")
     
-    if data['is_forward'] and data.get('forward_info'):
-        fwd_info = data['forward_info']
-        fwd_prefix = f"🔄 Переслано"
-        if fwd_info.get('chat_id'):
-            fwd_prefix += f" из {fwd_info['chat_id']}"
-        if text:
-            text = f"{fwd_prefix}\n\n{text}"
-        else:
-            text = fwd_prefix
+    # НЕ добавляем префикс "Переслано"
     
     if text and text.strip():
-        ok = await tg.text(text)
-        logger.info(f"[HANDLE] Text send: {'OK' if ok else 'FAIL'}")
-        await asyncio.sleep(0.2)
+        await tg.text(text)
+        await asyncio.sleep(0.3)
     
-    photo_video_items = []
-    other_attachments = []
-    
-    for att in data['attachments']:
-        tg_type, meta = media_processor.determine_type(att)
-        if tg_type in ('photo', 'video') and meta.get('url'):
-            photo_video_items.append({
-                'type': tg_type,
-                'media': meta['url'],
-                'caption': text if len(photo_video_items) == 0 else ''
-            })
-        else:
-            other_attachments.append(att)
-    
-    if photo_video_items:
-        logger.info(f"[HANDLE] Sending media group: {len(photo_video_items)} items")
-        ok = await tg.media_group(photo_video_items)
-        logger.info(f"[HANDLE] Media group send: {'OK' if ok else 'FAIL'}")
+    for i, att in enumerate(data['attachments']):
+        caption = text if i == 0 and not text else ""
+        await process_attachment(att, caption)
         await asyncio.sleep(0.5)
-    
-    for i, att in enumerate(other_attachments):
-        logger.info(f"[HANDLE] Processing attachment {i+1}/{len(other_attachments)}")
-        caption = text if i == 0 and not photo_video_items and not text else ""
-        ok = await process_attachment(att, caption)
-        delay = 0.3
-        if media_processor.determine_type(att)[0] == 'voice':
-            delay += 0.2
-        await asyncio.sleep(delay)
     
     if seq:
         _last_processed_seq = seq
-        logger.info(f"[HANDLE] Updated last_seq to {_last_processed_seq}")
+        logger.info(f"[HANDLE] Updated last_seq={seq}")
     
-    logger.info("[HANDLE] Complete")
     logger.info("=" * 60)
 
 
 # ===================================================================
-# 11. POLLING LOOP
+# 11. POLLING
 # ===================================================================
 async def polling_loop():
-    logger.info("🔄 Starting polling loop...")
+    global _last_processed_seq
+    logger.info("🔄 Polling started")
     await asyncio.sleep(2)
     
     while True:
         try:
-            msgs = await mx.fetch(limit=50)
-            
+            msgs = await mx.fetch(limit=10)
             if not msgs:
-                logger.debug("[POLL] No messages")
                 await asyncio.sleep(POLL_SEC)
                 continue
             
-            msgs_with_seq = [(extract_seq_from_msg(m), m) for m in msgs if isinstance(m, dict)]
-            msgs_with_seq.sort(key=lambda x: x[0])
+            # Сортируем и обрабатываем только новые
+            msgs.sort(key=extract_seq)
             
-            new_count = 0
-            for seq, msg in msgs_with_seq:
+            for msg in msgs:
+                seq = extract_seq(msg)
                 if seq > _last_processed_seq or DEBUG_IGNORE_SEQ:
                     await handle_message(msg)
-                    new_count += 1
+                    await asyncio.sleep(2.0)  # Защита от rate limit
                 else:
-                    logger.debug(f"[POLL] Skipping seq={seq} (<= {_last_processed_seq})")
-            
-            logger.info(f"[POLL] Processed {new_count} new messages out of {len(msgs)}")
+                    logger.debug(f"[POLL] Skip seq={seq}")
             
         except Exception as e:
-            logger.error(f"[POLL] Exception: {e}", exc_info=True)
+            logger.error(f"[POLL] {e}")
         
         await asyncio.sleep(POLL_SEC)
 
@@ -1016,38 +703,27 @@ async def polling_loop():
 # ===================================================================
 # 12. WEB SERVER
 # ===================================================================
-async def health_handler(request):
-    return web.json_response({
-        'ok': True,
-        'last_seq': _last_processed_seq,
-        'debug_ignore_seq': DEBUG_IGNORE_SEQ,
-        'ffmpeg_available': media_processor.ffmpeg_available
-    })
+async def health(request):
+    return web.json_response({'ok': True, 'last_seq': _last_processed_seq})
 
 
-async def run_app():
+async def run():
     app = web.Application()
-    app.router.add_get('/health', health_handler)
+    app.router.add_get('/health', health)
     
     runner = web.AppRunner(app)
     await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', 8080).start()
     
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
-    await site.start()
-    
-    logger.info("🌐 Health server running on :8080")
+    logger.info("🌐 Health server on :8080")
     await polling_loop()
 
 
-# ===================================================================
-# 13. ЗАПУСК
-# ===================================================================
 if __name__ == '__main__':
     try:
-        logger.info("🚀 Starting MAX → Telegram Forwarder...")
-        asyncio.run(run_app())
+        asyncio.run(run())
     except KeyboardInterrupt:
-        logger.info("🛑 Stopped by user")
+        logger.info("🛑 Stopped")
     except Exception as e:
-        logger.exception(f"💥 FATAL ERROR: {e}")
+        logger.exception(f"💥 FATAL: {e}")
         sys.exit(1)
