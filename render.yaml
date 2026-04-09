@@ -18,12 +18,14 @@ services:
         sync: false
       - key: MAX_API_BASE
         value: "https://platform-api.max.ru"
+      - key: MAX_WEBHOOK_SECRET
+        generateValue: true
+      - key: VERIFY_WEBHOOK_SECRET
+        value: "1"
       - key: POLL_INTERVAL
         value: "15"
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: DEBUG_IGNORE_SEQ
-        value: "0"
       - key: LOG_LEVEL
         value: "DEBUG"
       - key: LOG_RAW_MAX
