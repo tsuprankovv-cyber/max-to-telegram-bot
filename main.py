@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ: простая дедупликация через since_seq + файл
+ФИНАЛЬНАЯ ВЕРСИЯ: дедупликация через set() в памяти
 """
 import os
 import sys
@@ -58,8 +58,11 @@ POLL_SEC = int(os.getenv('POLL_INTERVAL', '15'))
 
 LAST_SEQ_FILE = 'last_seq.txt'
 
+# ДЕДУПЛИКАЦИЯ В ПАМЯТИ
+_processed_seqs = set()
+
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL SIMPLE VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"⏱️  Poll Interval: {POLL_SEC}s")
@@ -121,7 +124,6 @@ def fix_broken_html(text: str) -> str:
             text = re.sub(close_pattern, f'&lt;/{tag}&gt;', text, flags=re.IGNORECASE)
             logger.debug(f"[HTML] Escaped extra </{tag}>")
     
-    # Отдельно проверяем ссылки
     open_a = len(re.findall(r'<a\s+[^>]*>', text, re.IGNORECASE))
     close_a = len(re.findall(r'</a>', text, re.IGNORECASE))
     if open_a > close_a:
@@ -674,15 +676,11 @@ class MX:
         if not self.session:
             self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     
-    async def fetch(self, since_seq: Optional[int] = None, limit: int = 10) -> List[Dict]:
+    async def fetch(self, limit: int = 10) -> List[Dict]:
         await self.init()
         try:
             params = {'chat_id': self.cid, 'limit': limit}
-            if since_seq:
-                params['since_seq'] = since_seq
-                logger.debug(f"[MAX] Fetching with since_seq={since_seq}")
-            else:
-                logger.debug(f"[MAX] Fetching first messages")
+            logger.debug(f"[MAX] Fetching last {limit} messages")
             
             async with self.session.get(
                 f"{self.base}/messages",
@@ -871,37 +869,56 @@ async def handle_message(msg: Dict):
 
 
 # ===================================================================
-# 13. POLLING LOOP (ПРОСТАЯ ДЕДУПЛИКАЦИЯ ЧЕРЕЗ since_seq)
+# 13. POLLING LOOP (С ДЕДУПЛИКАЦИЕЙ В ПАМЯТИ)
 # ===================================================================
 async def polling_loop():
+    global _processed_seqs
     last_seq = load_last_seq()
-    logger.info(f"🔄 Polling started, last_seq={last_seq}")
+    logger.info(f"🔄 Polling started, last_seq={last_seq}, processed_count={len(_processed_seqs)}")
     await asyncio.sleep(2)
     
     while True:
         try:
-            msgs = await mx.fetch(since_seq=last_seq, limit=10)
+            msgs = await mx.fetch(limit=10)
             
             if not msgs:
-                logger.debug("[POLL] No new messages")
+                logger.debug("[POLL] No messages")
                 await asyncio.sleep(POLL_SEC)
                 continue
             
-            # Сортируем по seq
             msgs.sort(key=extract_seq)
             
+            new_count = 0
             for msg in msgs:
                 seq = extract_seq(msg)
-                logger.info(f"[POLL] Processing seq={seq}")
+                
+                # ПРОПУСКАЕМ УЖЕ ОБРАБОТАННЫЕ
+                if seq in _processed_seqs:
+                    logger.debug(f"[POLL] ⏭ Skip already processed seq={seq}")
+                    continue
+                
+                logger.info(f"[POLL] Processing NEW seq={seq}")
                 await handle_message(msg)
+                
+                _processed_seqs.add(seq)
+                new_count += 1
                 
                 if seq > last_seq:
                     last_seq = seq
                     save_last_seq(last_seq)
                 
-                await asyncio.sleep(2.0)  # Защита от rate limit
+                await asyncio.sleep(2.0)
             
-            logger.info(f"[POLL] Batch complete, last_seq={last_seq}")
+            if new_count > 0:
+                logger.info(f"[POLL] Processed {new_count} new messages")
+            else:
+                logger.debug(f"[POLL] No new messages in batch")
+            
+            # Ограничиваем размер set
+            if len(_processed_seqs) > 1000:
+                sorted_seqs = sorted(_processed_seqs)
+                _processed_seqs = set(sorted_seqs[-500:])
+                logger.debug(f"[POLL] Cleaned processed set, now {len(_processed_seqs)} items")
             
         except Exception as e:
             logger.error(f"[POLL] {e}", exc_info=True)
@@ -915,13 +932,16 @@ async def polling_loop():
 async def health(request):
     return web.json_response({
         'ok': True,
-        'last_seq': load_last_seq()
+        'last_seq': load_last_seq(),
+        'processed_count': len(_processed_seqs)
     })
 
 async def reset_handler(request):
+    global _processed_seqs
     save_last_seq(0)
-    logger.warning("[RESET] last_seq set to 0")
-    return web.json_response({'ok': True, 'last_seq': 0})
+    _processed_seqs.clear()
+    logger.warning("[RESET] last_seq=0, processed_seqs cleared")
+    return web.json_response({'ok': True, 'last_seq': 0, 'processed_cleared': True})
 
 
 async def run():
