@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-WEBHOOK ВЕРСИЯ - с исправлениями форматирования, скачивания и типов медиа
+WEBHOOK ВЕРСИЯ - ФИНАЛЬНАЯ
+- Форматирование с поддержкой вложенных тегов
+- Прямые ссылки для скачивания
+- Транслитерация имён файлов
+- Максимальное логирование
 """
 import os
 import sys
@@ -59,7 +63,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [WEBHOOK FIXED VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WEBHOOK VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -109,7 +113,68 @@ def fix_broken_html(text: str) -> str:
 
 
 # ===================================================================
-# 4. ГРАФЕМЫ
+# 4. ТРАНСЛИТЕРАЦИЯ
+# ===================================================================
+def transliterate_ru_to_en(text: str) -> str:
+    """Транслитерирует русский текст в латиницу."""
+    mapping = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
+        'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
+        'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u',
+        'ф': 'f', 'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'sch',
+        'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu', 'я': 'ya',
+        'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'Yo',
+        'Ж': 'Zh', 'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M',
+        'Н': 'N', 'О': 'O', 'П': 'P', 'Р': 'R', 'С': 'S', 'Т': 'T', 'У': 'U',
+        'Ф': 'F', 'Х': 'Kh', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Sch',
+        'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya'
+    }
+    
+    result = ''
+    for char in text:
+        result += mapping.get(char, char)
+    
+    # Заменяем пробелы и спецсимволы на подчёркивание
+    result = re.sub(r'[^a-zA-Z0-9._-]', '_', result)
+    # Убираем множественные подчёркивания
+    result = re.sub(r'_+', '_', result)
+    
+    return result
+
+
+def safe_filename(filename: str) -> str:
+    """Создаёт безопасное имя файла с транслитерацией."""
+    if not filename:
+        return 'file'
+    
+    # Разделяем имя и расширение
+    if '.' in filename:
+        name, ext = filename.rsplit('.', 1)
+    else:
+        name, ext = filename, ''
+    
+    # Транслитерируем
+    safe_name = transliterate_ru_to_en(name)
+    
+    # Если имя пустое, используем 'file'
+    if not safe_name or safe_name == '_':
+        safe_name = 'file'
+    
+    # Ограничиваем длину
+    if len(safe_name) > 100:
+        safe_name = safe_name[:100]
+    
+    # Убираем точки и подчёркивания в начале/конце
+    safe_name = safe_name.strip('._')
+    
+    # Собираем обратно
+    if ext:
+        return f"{safe_name}.{ext}"
+    return safe_name
+
+
+# ===================================================================
+# 5. ГРАФЕМЫ
 # ===================================================================
 def split_into_graphemes(text: str) -> List[str]:
     """Разбивает текст на графемы для корректной работы с эмодзи."""
@@ -141,7 +206,7 @@ def split_into_graphemes(text: str) -> List[str]:
 
 
 # ===================================================================
-# 5. ПОИСК И КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕНО)
+# 6. ПОИСК И КОНВЕРТАЦИЯ РАЗМЕТКИ (С ПОДДЕРЖКОЙ ВЛОЖЕННОСТИ)
 # ===================================================================
 def find_markup_in_message(msg: Dict) -> Tuple[List[Dict], str]:
     """
@@ -155,33 +220,27 @@ def find_markup_in_message(msg: Dict) -> Tuple[List[Dict], str]:
     if isinstance(body, dict):
         logger.debug(f"[MARKUP] Body keys: {list(body.keys())}")
         
-        # Логируем все потенциальные поля разметки
         for key in ['entities', 'text_entities', 'markup', 'formats', 'styles']:
             if key in body and body[key]:
                 logger.info(f"[MARKUP] body.{key} = {json.dumps(body[key], ensure_ascii=False)[:300]}")
         
-        # 1. entities (формат как в Telegram)
         if 'entities' in body and body['entities']:
             logger.info(f"[MARKUP] ✅ Found {len(body['entities'])} entities in body.entities")
             return body['entities'], "body.entities"
         
-        # 2. text_entities
         if 'text_entities' in body and body['text_entities']:
             logger.info(f"[MARKUP] ✅ Found {len(body['text_entities'])} entities in body.text_entities")
             return body['text_entities'], "body.text_entities"
         
-        # 3. markup (старый формат)
         if 'markup' in body and body['markup']:
             logger.info(f"[MARKUP] ✅ Found {len(body['markup'])} items in body.markup")
             return body['markup'], "body.markup"
     
-    # Проверяем корень сообщения
     for field in ['entities', 'text_entities', 'markup']:
         if field in msg and msg[field]:
             logger.info(f"[MARKUP] ✅ Found {len(msg[field])} items in root.{field}")
             return msg[field], f"root.{field}"
     
-    # Проверяем forward
     link = msg.get('link', {})
     if isinstance(link, dict) and 'message' in link:
         inner = link['message']
@@ -199,7 +258,7 @@ def find_markup_in_message(msg: Dict) -> Tuple[List[Dict], str]:
 def apply_markup(text: str, entities: List[Dict]) -> str:
     """
     Конвертирует entities в HTML для Telegram.
-    Проверенный алгоритм из TG → MAX бота.
+    Корректно обрабатывает вложенные теги через стек.
     """
     if not entities or not text:
         return text
@@ -207,82 +266,105 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
     logger.info(f"[MARKUP] Converting: text_len={len(text)}, entities={len(entities)}")
     start_time = time.time()
     
-    # Маппинг типов → HTML теги
     TAG_MAP = {
-        'bold': ('<b>', '</b>'),
-        'strong': ('<b>', '</b>'),
-        'italic': ('<i>', '</i>'),
-        'em': ('<i>', '</i>'),
-        'underline': ('<u>', '</u>'),
-        'u': ('<u>', '</u>'),
-        'strikethrough': ('<s>', '</s>'),
-        'strike': ('<s>', '</s>'),
-        's': ('<s>', '</s>'),
-        'code': ('<code>', '</code>'),
-        'inline-code': ('<code>', '</code>'),
-        'pre': ('<pre>', '</pre>'),
-        'preformatted': ('<pre>', '</pre>'),
-        'spoiler': ('<tg-spoiler>', '</tg-spoiler>'),
-        'text_link': ('<a href="{url}">', '</a>'),
-        'link': ('<a href="{url}">', '</a>'),
+        'bold': ('b',), 'strong': ('b',),
+        'italic': ('i',), 'em': ('i',),
+        'underline': ('u',), 'u': ('u',),
+        'strikethrough': ('s',), 'strike': ('s',), 's': ('s',),
+        'code': ('code',), 'inline-code': ('code',),
+        'pre': ('pre',), 'preformatted': ('pre',),
+        'spoiler': ('tg-spoiler',),
+        'text_link': ('a',), 'link': ('a',),
     }
     
     graphemes = split_into_graphemes(text)
+    n = len(graphemes)
     
-    # Сортируем с конца, чтобы не сбивались индексы
-    sorted_entities = sorted(entities, key=lambda e: e.get('offset', 0), reverse=True)
-    
-    for idx, entity in enumerate(sorted_entities):
+    # Создаём события открытия и закрытия тегов
+    events = []
+    for idx, entity in enumerate(entities):
         try:
             offset = int(entity.get('offset', 0))
             length = int(entity.get('length', 0))
             etype = entity.get('type', '')
             
-            if offset < 0 or length <= 0 or offset + length > len(graphemes):
-                logger.warning(f"[MARKUP] Invalid entity: offset={offset}, length={length}, max={len(graphemes)}")
+            if offset < 0 or length <= 0 or offset + length > n:
+                logger.warning(f"[MARKUP] Invalid entity: offset={offset}, length={length}, max={n}")
                 continue
             
             if etype not in TAG_MAP:
                 logger.debug(f"[MARKUP] Unknown type: '{etype}'")
                 continue
             
-            fragment = ''.join(graphemes[offset:offset+length])
+            tag_name = TAG_MAP[etype][0]
             
             if etype in ('text_link', 'link'):
                 url = entity.get('url') or entity.get('href') or ''
                 if not url:
                     continue
                 url_safe = url.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-                open_tag = TAG_MAP[etype][0].format(url=url_safe)
+                open_tag = f'<{tag_name} href="{url_safe}">'
             else:
-                open_tag = TAG_MAP[etype][0]
+                open_tag = f'<{tag_name}>'
             
-            close_tag = TAG_MAP[etype][1]
+            close_tag = f'</{tag_name}>'
             
-            graphemes[offset:offset+length] = [open_tag + fragment + close_tag]
-            logger.debug(f"[MARKUP] {etype} [{offset}:{offset+length}] '{fragment[:30]}'")
+            events.append((offset, 'open', open_tag, close_tag, idx))
+            events.append((offset + length, 'close', open_tag, close_tag, idx))
+            
+            logger.debug(f"[MARKUP] {etype} [{offset}:{offset+length}]")
             
         except Exception as e:
-            logger.error(f"[MARKUP] Error: {e}")
+            logger.error(f"[MARKUP] Error processing entity {idx}: {e}")
     
-    result = ''.join(graphemes)
+    # Сортируем: сначала по позиции, закрывающие перед открывающими
+    events.sort(key=lambda x: (x[0], 0 if x[1] == 'close' else 1, -x[4]))
+    
+    # Строим результат через стек
+    result = []
+    active_tags = []  # Стек открытых тегов
+    event_idx = 0
+    
+    for pos in range(n + 1):
+        # Обрабатываем все события на текущей позиции
+        while event_idx < len(events) and events[event_idx][0] == pos:
+            _, etype, open_tag, close_tag, _ = events[event_idx]
+            if etype == 'close':
+                # Ищем соответствующий открывающий тег в стеке
+                for i in range(len(active_tags) - 1, -1, -1):
+                    if active_tags[i][0] == open_tag:
+                        result.append(active_tags[i][1])
+                        active_tags.pop(i)
+                        break
+            else:
+                active_tags.append((open_tag, close_tag))
+                result.append(open_tag)
+            event_idx += 1
+        
+        if pos < n:
+            result.append(graphemes[pos])
+    
+    # Закрываем оставшиеся теги
+    for _, close_tag in reversed(active_tags):
+        result.append(close_tag)
+    
+    final_text = ''.join(result)
     elapsed = time.time() - start_time
     
-    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s: {len(text)} → {len(result)} chars")
-    logger.debug(f"[MARKUP] Preview: {result[:200]}...")
+    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s: {len(text)} → {len(final_text)} chars")
+    logger.debug(f"[MARKUP] Preview: {final_text[:200]}...")
     
-    return result
+    return final_text
 
 
 # ===================================================================
-# 6. ИЗВЛЕЧЕНИЕ ДАННЫХ
+# 7. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
     """Извлекает все данные из сообщения MAX."""
     logger.info(f"[EXTRACT] Starting extraction...")
     logger.debug(f"[EXTRACT] Message keys: {list(msg.keys())}")
     
-    # Проверяем forward
     link = msg.get('link', {})
     is_forward = False
     if isinstance(link, dict) and link.get('type') == 'forward' and 'message' in link:
@@ -326,7 +408,7 @@ def extract_message_data(msg: Dict) -> Dict:
 
 
 # ===================================================================
-# 7. АУДИО УТИЛИТЫ
+# 8. АУДИО УТИЛИТЫ
 # ===================================================================
 def get_audio_duration(file_path: str) -> int:
     """Получает длительность аудио через ffprobe."""
@@ -377,7 +459,10 @@ def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
     
     os.unlink(tmp_path)
     
-    name = filename.rsplit('.', 1)[0] if '.' in filename else filename
+    # Используем транслитерированное имя для fallback
+    safe_name = safe_filename(filename)
+    name = safe_name.rsplit('.', 1)[0] if '.' in safe_name else safe_name
+    
     if ' - ' in name:
         parts = name.split(' - ', 1)
         performer = performer or parts[0].strip()
@@ -446,7 +531,7 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
 
 
 # ===================================================================
-# 8. СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ (НОВОЕ)
+# 9. СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
     """Скачивает файл по прямой ссылке из payload.url."""
@@ -479,7 +564,7 @@ async def download_from_url(url: str) -> Optional[bytes]:
 
 
 # ===================================================================
-# 9. MEDIA PROCESSOR (ИСПРАВЛЕНО)
+# 10. MEDIA PROCESSOR
 # ===================================================================
 class MediaProcessor:
     """Определяет тип медиа и подготавливает к отправке."""
@@ -575,7 +660,7 @@ class MediaProcessor:
 
 
 # ===================================================================
-# 10. TELEGRAM CLIENT
+# 11. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     """Клиент Telegram Bot API."""
@@ -666,13 +751,15 @@ class TG:
         form = aiohttp.FormData()
         form.add_field('chat_id', self.chat_id)
         
+        # Используем безопасное имя файла
+        safe_fname = safe_filename(filename) if filename else f"{media_type}.file"
+        
         if is_url:
             form.add_field(field, media_data)
             logger.debug(f"[TG] Using URL: {str(media_data)[:80]}...")
         else:
-            fname = filename or f"{media_type}.file"
-            form.add_field(field, media_data, filename=fname)
-            logger.debug(f"[TG] Using file: {fname}")
+            form.add_field(field, media_data, filename=safe_fname)
+            logger.debug(f"[TG] Using file: {safe_fname}")
         
         if caption and media_type != 'document':
             caption = fix_broken_html(caption)
@@ -697,7 +784,7 @@ class TG:
 
 
 # ===================================================================
-# 11. MAX CLIENT
+# 12. MAX CLIENT
 # ===================================================================
 class MX:
     """Клиент MAX API."""
@@ -753,7 +840,7 @@ class MX:
 
 
 # ===================================================================
-# 12. ОБРАБОТЧИКИ
+# 13. ОБРАБОТЧИКИ
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -774,7 +861,6 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     logger.info(f"[ATT] Type: {tg_type}, filename: {meta.get('filename')}, size: {meta.get('size')}")
     logger.info(f"[ATT] Has URL: {bool(meta.get('url'))}, Has token: {bool(meta.get('token'))}")
     
-    # ВСЕГДА ИСПОЛЬЗУЕМ ПРЯМУЮ ССЫЛКУ ИЗ PAYLOAD.URL
     direct_url = meta.get('url')
     
     if not direct_url:
@@ -782,7 +868,6 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         return False
     
     file_data = None
-    is_url = False
     
     # Для фото/видео можно отправить URL напрямую
     if tg_type in ('photo', 'video') and direct_url:
@@ -791,6 +876,7 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
             media_type=tg_type,
             media_data=direct_url,
             caption=caption,
+            filename=safe_filename(meta.get('filename', '')),
             is_url=True
         )
         elapsed = time.time() - start_time
@@ -836,7 +922,7 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         media_type=tg_type,
         media_data=file_data,
         caption=caption if tg_type != 'document' else '',
-        filename=meta.get('filename', ''),
+        filename=safe_filename(meta.get('filename', '')),
         is_url=False,
         **extra
     )
@@ -855,14 +941,12 @@ async def handle_max_message(msg: Dict):
     if LOG_RAW_MAX:
         logger.debug(f"[HANDLE] Raw message: {json.dumps(msg, ensure_ascii=False)[:1500]}")
     
-    # Извлекаем данные
     data = extract_message_data(msg)
     
     if not data['text'] and not data['attachments']:
         logger.info("[HANDLE] ⏭ Empty message, skipping")
         return
     
-    # Применяем разметку
     text = data['text']
     if data['markup']:
         logger.info(f"[HANDLE] Applying markup from {data['markup_source']}...")
@@ -892,7 +976,7 @@ async def handle_max_message(msg: Dict):
 
 
 # ===================================================================
-# 13. WEBHOOK HANDLER
+# 14. WEBHOOK HANDLER
 # ===================================================================
 async def webhook_handler(request):
     """Принимает webhook от MAX API."""
@@ -953,16 +1037,16 @@ async def health_handler(request):
     return web.json_response({
         'ok': True,
         'service': 'MAX → Telegram Forwarder',
-        'version': 'webhook-fixed'
+        'version': 'webhook-final'
     })
 
 
 # ===================================================================
-# 14. ЗАПУСК
+# 15. ЗАПУСК
 # ===================================================================
 async def main():
     """Точка входа."""
-    logger.info("🚀 Starting MAX → Telegram Forwarder [WEBHOOK FIXED VERSION]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL WEBHOOK VERSION]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
