@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-WEBHOOK ВЕРСИЯ - ФИНАЛЬНАЯ
-- Исправлено форматирование (комбинации тегов)
-- Прямые ссылки для скачивания
-- Транслитерация имён файлов
-- Максимальное логирование
+Версия с Markdown-парсингом и максимальным логированием
 """
 import os
 import sys
@@ -63,7 +59,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION - FIXED MARKUP]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [MARKDOWN PARSING VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -198,7 +194,7 @@ def split_into_graphemes(text: str) -> List[str]:
 
 
 # ===================================================================
-# 6. ПОИСК И КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕНО)
+# 6. ПОИСК И КОНВЕРТАЦИЯ РАЗМЕТКИ (С ПОДДЕРЖКОЙ MARKDOWN)
 # ===================================================================
 def find_markup_in_message(msg: Dict) -> Tuple[List[Dict], str]:
     """Ищет разметку в сообщении MAX."""
@@ -252,7 +248,7 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
     if not entities or not text:
         return text
     
-    logger.info(f"[MARKUP] Converting: text_len={len(text)}, entities={len(entities)}")
+    logger.info(f"[MARKUP] Converting entities: text_len={len(text)}, entities={len(entities)}")
     start_time = time.time()
     
     TAG_MAP = {
@@ -269,11 +265,8 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
     graphemes = split_into_graphemes(text)
     n = len(graphemes)
     
-    # Для каждой позиции храним множество открывающих и закрывающих тегов
     opens_at = [set() for _ in range(n + 1)]
     closes_at = [set() for _ in range(n + 1)]
-    
-    # Атрибуты для ссылок
     link_attrs = {}
     
     for idx, entity in enumerate(entities):
@@ -304,15 +297,11 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
         except Exception as e:
             logger.error(f"[MARKUP] Error: {e}")
     
-    # Строим результат
     result = []
     open_stack = []
-    
-    # Порядок тегов для детерминированного вывода
     tag_order = ['b', 'i', 'u', 's', 'code', 'pre', 'tg-spoiler', 'a']
     
     for pos in range(n + 1):
-        # Закрываем теги
         if closes_at[pos]:
             to_close = []
             for tag in reversed(open_stack):
@@ -323,7 +312,6 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
                 result.append(f'</{tag}>')
                 open_stack.remove(tag)
         
-        # Открываем теги
         if opens_at[pos]:
             sorted_tags = sorted(opens_at[pos], key=lambda t: tag_order.index(t) if t in tag_order else 999)
             
@@ -337,17 +325,51 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
         if pos < n:
             result.append(graphemes[pos])
     
-    # Закрываем оставшиеся
     for tag_name in reversed(open_stack):
         result.append(f'</{tag_name}>')
     
     final_text = ''.join(result)
     elapsed = time.time() - start_time
     
-    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s: {len(text)} → {len(final_text)} chars")
+    logger.info(f"[MARKUP] ✅ Converted entities in {elapsed:.2f}s: {len(text)} → {len(final_text)} chars")
     logger.debug(f"[MARKUP] Preview: {final_text[:200]}...")
     
     return final_text
+
+
+def parse_markdown_to_html(text: str) -> str:
+    """
+    Конвертирует Markdown от MAX в HTML для Telegram.
+    Поддерживает: **жирный**, *курсив*, __подчёркнутый__, ~~зачёркнутый~~, [ссылка](url)
+    """
+    if not text:
+        return text
+    
+    logger.info(f"[MARKDOWN] Parsing markdown: {text[:100]}...")
+    start_time = time.time()
+    
+    # Жирный: **текст** или __текст__
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
+    
+    # Курсив: *текст* (но не **)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
+    text = re.sub(r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', r'<i>\1</i>', text)
+    
+    # Подчёркнутый: ++текст++
+    text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
+    
+    # Зачёркнутый: ~~текст~~
+    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+    
+    # Ссылки: [текст](url)
+    text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
+    
+    elapsed = time.time() - start_time
+    logger.info(f"[MARKDOWN] ✅ Parsed to HTML in {elapsed:.2f}s")
+    logger.debug(f"[MARKDOWN] Result: {text[:200]}...")
+    
+    return text
 
 
 # ===================================================================
@@ -383,6 +405,9 @@ def extract_message_data(msg: Dict) -> Dict:
     seq = body.get('seq') or inner.get('seq') or msg.get('seq', 0)
     timestamp = msg.get('timestamp', 0)
     
+    # Извлекаем reply_markup (кнопки) если есть
+    reply_markup = inner.get('reply_markup') or msg.get('reply_markup')
+    
     result = {
         "mid": mid,
         "seq": seq,
@@ -391,11 +416,14 @@ def extract_message_data(msg: Dict) -> Dict:
         "markup": markup,
         "markup_source": markup_source,
         "attachments": attachments,
-        "is_forward": is_forward
+        "is_forward": is_forward,
+        "reply_markup": reply_markup
     }
     
     logger.info(f"[EXTRACT] ✅ mid={mid[:30]}..., text_len={len(text)}, attachments={len(attachments)}, markup={len(markup)}")
     logger.info(f"[EXTRACT] Markup source: {markup_source}")
+    if reply_markup:
+        logger.info(f"[EXTRACT] 🎛️ Found reply_markup: {json.dumps(reply_markup, ensure_ascii=False)[:300]}")
     
     return result
 
@@ -707,7 +735,7 @@ class TG:
             logger.error(f"[TG] ❌ Exception: {e}")
             return None
     
-    async def send_text(self, text: str) -> bool:
+    async def send_text(self, text: str, reply_markup: Optional[Dict] = None) -> bool:
         """Отправляет текстовое сообщение."""
         if not text or not text.strip():
             logger.debug("[TG] Empty text, skipping")
@@ -716,12 +744,17 @@ class TG:
         text = fix_broken_html(text)
         logger.info(f"[TG] 📤 Sending text: {text[:50]}...")
         
-        resp = await self._request('sendMessage', json={
+        payload = {
             'chat_id': self.chat_id,
             'text': text,
             'parse_mode': 'HTML',
             'disable_web_page_preview': False
-        })
+        }
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
+            logger.info(f"[TG] 🎛️ Sending with reply_markup")
+        
+        resp = await self._request('sendMessage', json=payload)
         return resp is not None and resp.get('ok', False)
     
     async def send_media(self, media_type: str, media_data: Union[str, bytes],
@@ -838,6 +871,37 @@ mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 media_proc = MediaProcessor()
 
 
+def convert_max_buttons(reply_markup: Dict) -> Optional[Dict]:
+    """Конвертирует кнопки MAX в формат Telegram."""
+    if not reply_markup:
+        return None
+    
+    keyboard = reply_markup.get('inline_keyboard') or reply_markup.get('keyboard')
+    if not keyboard or not isinstance(keyboard, list):
+        return None
+    
+    telegram_keyboard = []
+    for row in keyboard:
+        telegram_row = []
+        for button in row:
+            if button.get('type') == 'url' or button.get('url'):
+                telegram_row.append({
+                    'text': button.get('text', 'Button'),
+                    'url': button.get('url', '')
+                })
+            elif button.get('type') == 'callback':
+                telegram_row.append({
+                    'text': button.get('text', 'Button'),
+                    'callback_data': button.get('payload', '{}')
+                })
+        if telegram_row:
+            telegram_keyboard.append(telegram_row)
+    
+    if telegram_keyboard:
+        return {'inline_keyboard': telegram_keyboard}
+    return None
+
+
 async def process_attachment(att: Dict, caption: str = "") -> bool:
     """Обрабатывает одно вложение через прямую ссылку."""
     start_time = time.time()
@@ -935,12 +999,23 @@ async def handle_max_message(msg: Dict):
     
     text = data['text']
     if data['markup']:
-        logger.info(f"[HANDLE] Applying markup from {data['markup_source']}...")
+        logger.info(f"[HANDLE] Applying entities from {data['markup_source']}...")
         text = apply_markup(text, data['markup'])
+    elif text and ('**' in text or '*' in text or '__' in text or '++' in text or '[' in text):
+        logger.info("[HANDLE] 📝 Trying Markdown parsing...")
+        text = parse_markdown_to_html(text)
     
+    # Конвертируем кнопки если есть
+    reply_markup = None
+    if data.get('reply_markup'):
+        reply_markup = convert_max_buttons(data['reply_markup'])
+        if reply_markup:
+            logger.info(f"[HANDLE] 🎛️ Converted buttons for Telegram")
+    
+    # Отправляем текст (с кнопками, если они есть)
     if text and text.strip():
         text_start = time.time()
-        ok = await tg.send_text(text)
+        ok = await tg.send_text(text, reply_markup=reply_markup)
         text_elapsed = time.time() - text_start
         if not ok:
             logger.error(f"[HANDLE] ❌ Failed to send text in {text_elapsed:.2f}s")
@@ -948,6 +1023,7 @@ async def handle_max_message(msg: Dict):
             logger.info(f"[HANDLE] ✅ Text sent in {text_elapsed:.2f}s")
         await asyncio.sleep(0.3)
     
+    # Отправляем вложения (без кнопок, они уже с текстом)
     for i, att in enumerate(data['attachments']):
         logger.info(f"[HANDLE] Processing attachment {i+1}/{len(data['attachments'])}")
         caption = text if i == 0 and not text else ""
@@ -960,7 +1036,7 @@ async def handle_max_message(msg: Dict):
 
 
 # ===================================================================
-# 14. WEBHOOK HANDLER
+# 14. WEBHOOK HANDLER (С МАКСИМАЛЬНЫМ ЛОГИРОВАНИЕМ)
 # ===================================================================
 async def webhook_handler(request):
     """Принимает webhook от MAX API."""
@@ -982,10 +1058,24 @@ async def webhook_handler(request):
     
     try:
         body = await request.json()
-        logger.info(f"[WEBHOOK] Body keys: {list(body.keys())}")
+        logger.info(f"[WEBHOOK] 🔑 ALL TOP-LEVEL KEYS: {list(body.keys())}")
+        
+        # Рекурсивно выводим все ключи в ответе
+        def log_keys(data, indent=0):
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    logger.info(f"[WEBHOOK] {'  '*indent}🔹 {key}: {type(value).__name__}")
+                    if isinstance(value, (dict, list)) and indent < 3:  # ограничим глубину
+                        log_keys(value, indent+1)
+            elif isinstance(data, list) and data:
+                logger.info(f"[WEBHOOK] {'  '*indent}🔸 list[{len(data)}]")
+                if isinstance(data[0], dict):
+                    log_keys(data[0], indent+1)
+        
+        log_keys(body)
         
         if LOG_RAW_MAX:
-            logger.debug(f"[WEBHOOK] Full body: {json.dumps(body, ensure_ascii=False)[:1500]}")
+            logger.debug(f"[WEBHOOK] Full body: {json.dumps(body, ensure_ascii=False)[:3000]}")
         
         update_type = body.get('update_type', 'unknown')
         logger.info(f"[WEBHOOK] Update type: {update_type}")
@@ -1021,7 +1111,7 @@ async def health_handler(request):
     return web.json_response({
         'ok': True,
         'service': 'MAX → Telegram Forwarder',
-        'version': 'webhook-final-fixed'
+        'version': 'markdown-parsing'
     })
 
 
@@ -1030,7 +1120,7 @@ async def health_handler(request):
 # ===================================================================
 async def main():
     """Точка входа."""
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL VERSION - FIXED MARKUP]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [MARKDOWN PARSING VERSION]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
