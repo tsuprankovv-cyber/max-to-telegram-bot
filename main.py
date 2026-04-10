@@ -2,7 +2,7 @@
 """
 MAX → Telegram Forwarder
 WEBHOOK ВЕРСИЯ - ФИНАЛЬНАЯ
-- Форматирование с поддержкой вложенных тегов
+- Исправлено форматирование (комбинации тегов)
 - Прямые ссылки для скачивания
 - Транслитерация имён файлов
 - Максимальное логирование
@@ -63,7 +63,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WEBHOOK VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION - FIXED MARKUP]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -134,9 +134,7 @@ def transliterate_ru_to_en(text: str) -> str:
     for char in text:
         result += mapping.get(char, char)
     
-    # Заменяем пробелы и спецсимволы на подчёркивание
     result = re.sub(r'[^a-zA-Z0-9._-]', '_', result)
-    # Убираем множественные подчёркивания
     result = re.sub(r'_+', '_', result)
     
     return result
@@ -147,27 +145,21 @@ def safe_filename(filename: str) -> str:
     if not filename:
         return 'file'
     
-    # Разделяем имя и расширение
     if '.' in filename:
         name, ext = filename.rsplit('.', 1)
     else:
         name, ext = filename, ''
     
-    # Транслитерируем
     safe_name = transliterate_ru_to_en(name)
     
-    # Если имя пустое, используем 'file'
     if not safe_name or safe_name == '_':
         safe_name = 'file'
     
-    # Ограничиваем длину
     if len(safe_name) > 100:
         safe_name = safe_name[:100]
     
-    # Убираем точки и подчёркивания в начале/конце
     safe_name = safe_name.strip('._')
     
-    # Собираем обратно
     if ext:
         return f"{safe_name}.{ext}"
     return safe_name
@@ -206,13 +198,10 @@ def split_into_graphemes(text: str) -> List[str]:
 
 
 # ===================================================================
-# 6. ПОИСК И КОНВЕРТАЦИЯ РАЗМЕТКИ (С ПОДДЕРЖКОЙ ВЛОЖЕННОСТИ)
+# 6. ПОИСК И КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕНО)
 # ===================================================================
 def find_markup_in_message(msg: Dict) -> Tuple[List[Dict], str]:
-    """
-    Ищет разметку в сообщении MAX.
-    Приоритет: entities → text_entities → markup.
-    """
+    """Ищет разметку в сообщении MAX."""
     logger.info(f"[MARKUP] 🔍 Searching for markup...")
     logger.debug(f"[MARKUP] Message keys: {list(msg.keys())}")
     
@@ -258,7 +247,7 @@ def find_markup_in_message(msg: Dict) -> Tuple[List[Dict], str]:
 def apply_markup(text: str, entities: List[Dict]) -> str:
     """
     Конвертирует entities в HTML для Telegram.
-    Корректно обрабатывает вложенные теги через стек.
+    Правильно обрабатывает множественные сущности на одном диапазоне.
     """
     if not entities or not text:
         return text
@@ -267,21 +256,26 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
     start_time = time.time()
     
     TAG_MAP = {
-        'bold': ('b',), 'strong': ('b',),
-        'italic': ('i',), 'em': ('i',),
-        'underline': ('u',), 'u': ('u',),
-        'strikethrough': ('s',), 'strike': ('s',), 's': ('s',),
-        'code': ('code',), 'inline-code': ('code',),
-        'pre': ('pre',), 'preformatted': ('pre',),
-        'spoiler': ('tg-spoiler',),
-        'text_link': ('a',), 'link': ('a',),
+        'bold': 'b', 'strong': 'b',
+        'italic': 'i', 'em': 'i',
+        'underline': 'u', 'u': 'u',
+        'strikethrough': 's', 'strike': 's', 's': 's',
+        'code': 'code', 'inline-code': 'code',
+        'pre': 'pre', 'preformatted': 'pre',
+        'spoiler': 'tg-spoiler',
+        'text_link': 'a', 'link': 'a',
     }
     
     graphemes = split_into_graphemes(text)
     n = len(graphemes)
     
-    # Создаём события открытия и закрытия тегов
-    events = []
+    # Для каждой позиции храним множество открывающих и закрывающих тегов
+    opens_at = [set() for _ in range(n + 1)]
+    closes_at = [set() for _ in range(n + 1)]
+    
+    # Атрибуты для ссылок
+    link_attrs = {}
+    
     for idx, entity in enumerate(entities):
         try:
             offset = int(entity.get('offset', 0))
@@ -289,64 +283,63 @@ def apply_markup(text: str, entities: List[Dict]) -> str:
             etype = entity.get('type', '')
             
             if offset < 0 or length <= 0 or offset + length > n:
-                logger.warning(f"[MARKUP] Invalid entity: offset={offset}, length={length}, max={n}")
                 continue
             
             if etype not in TAG_MAP:
-                logger.debug(f"[MARKUP] Unknown type: '{etype}'")
                 continue
             
-            tag_name = TAG_MAP[etype][0]
+            tag_name = TAG_MAP[etype]
+            
+            opens_at[offset].add(tag_name)
+            closes_at[offset + length].add(tag_name)
             
             if etype in ('text_link', 'link'):
                 url = entity.get('url') or entity.get('href') or ''
-                if not url:
-                    continue
-                url_safe = url.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-                open_tag = f'<{tag_name} href="{url_safe}">'
-            else:
-                open_tag = f'<{tag_name}>'
+                if url:
+                    url_safe = url.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+                    link_attrs[(offset, tag_name)] = f' href="{url_safe}"'
             
-            close_tag = f'</{tag_name}>'
-            
-            events.append((offset, 'open', open_tag, close_tag, idx))
-            events.append((offset + length, 'close', open_tag, close_tag, idx))
-            
-            logger.debug(f"[MARKUP] {etype} [{offset}:{offset+length}]")
+            logger.debug(f"[MARKUP] {etype}: [{offset}:{offset+length}]")
             
         except Exception as e:
-            logger.error(f"[MARKUP] Error processing entity {idx}: {e}")
+            logger.error(f"[MARKUP] Error: {e}")
     
-    # Сортируем: сначала по позиции, закрывающие перед открывающими
-    events.sort(key=lambda x: (x[0], 0 if x[1] == 'close' else 1, -x[4]))
-    
-    # Строим результат через стек
+    # Строим результат
     result = []
-    active_tags = []  # Стек открытых тегов
-    event_idx = 0
+    open_stack = []
+    
+    # Порядок тегов для детерминированного вывода
+    tag_order = ['b', 'i', 'u', 's', 'code', 'pre', 'tg-spoiler', 'a']
     
     for pos in range(n + 1):
-        # Обрабатываем все события на текущей позиции
-        while event_idx < len(events) and events[event_idx][0] == pos:
-            _, etype, open_tag, close_tag, _ = events[event_idx]
-            if etype == 'close':
-                # Ищем соответствующий открывающий тег в стеке
-                for i in range(len(active_tags) - 1, -1, -1):
-                    if active_tags[i][0] == open_tag:
-                        result.append(active_tags[i][1])
-                        active_tags.pop(i)
-                        break
-            else:
-                active_tags.append((open_tag, close_tag))
-                result.append(open_tag)
-            event_idx += 1
+        # Закрываем теги
+        if closes_at[pos]:
+            to_close = []
+            for tag in reversed(open_stack):
+                if tag in closes_at[pos]:
+                    to_close.append(tag)
+            
+            for tag in to_close:
+                result.append(f'</{tag}>')
+                open_stack.remove(tag)
+        
+        # Открываем теги
+        if opens_at[pos]:
+            sorted_tags = sorted(opens_at[pos], key=lambda t: tag_order.index(t) if t in tag_order else 999)
+            
+            for tag_name in sorted_tags:
+                if tag_name not in open_stack:
+                    key = (pos, tag_name)
+                    attrs = link_attrs.get(key, '')
+                    result.append(f'<{tag_name}{attrs}>')
+                    open_stack.append(tag_name)
         
         if pos < n:
             result.append(graphemes[pos])
     
-    # Закрываем оставшиеся теги
-    for _, close_tag in reversed(active_tags):
-        result.append(close_tag)
+    # Закрываем оставшиеся
+    for tag_name in reversed(open_stack):
+        result.append(f'</{tag_name}>')
     
     final_text = ''.join(result)
     elapsed = time.time() - start_time
@@ -459,7 +452,6 @@ def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
     
     os.unlink(tmp_path)
     
-    # Используем транслитерированное имя для fallback
     safe_name = safe_filename(filename)
     name = safe_name.rsplit('.', 1)[0] if '.' in safe_name else safe_name
     
@@ -751,7 +743,6 @@ class TG:
         form = aiohttp.FormData()
         form.add_field('chat_id', self.chat_id)
         
-        # Используем безопасное имя файла
         safe_fname = safe_filename(filename) if filename else f"{media_type}.file"
         
         if is_url:
@@ -869,7 +860,6 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     
     file_data = None
     
-    # Для фото/видео можно отправить URL напрямую
     if tg_type in ('photo', 'video') and direct_url:
         logger.info(f"[ATT] 📤 Using direct URL for {tg_type}")
         result = await tg.send_media(
@@ -883,7 +873,6 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         logger.info(f"[ATT] {'✅' if result else '❌'} Send result in {elapsed:.2f}s")
         return result
     
-    # Для аудио/голосовых/документов - скачиваем
     logger.info(f"[ATT] 📥 Downloading {tg_type} from direct URL...")
     file_data = await download_from_url(direct_url)
     
@@ -893,7 +882,6 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     
     extra = {}
     
-    # Конвертация аудио в голосовое (если маленький файл)
     if tg_type == 'audio' and meta.get('size', 0) < 2 * 1024 * 1024 and media_proc.ffmpeg_ok:
         logger.info(f"[ATT] 🎤 Trying voice conversion (size={meta.get('size')} < 2MB)...")
         voice_data = convert_to_voice(file_data)
@@ -909,13 +897,11 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         else:
             logger.warning(f"[ATT] ⚠️ Conversion failed, sending as audio")
     
-    # Теги для аудио
     if tg_type == 'audio':
         tags = extract_audio_tags(file_data, meta.get('filename', ''))
         extra.update(tags)
         logger.info(f"[ATT] Audio tags: {tags}")
     
-    # Отправка
     logger.info(f"[ATT] 📤 Sending {tg_type} to Telegram...")
     
     result = await tg.send_media(
@@ -952,7 +938,6 @@ async def handle_max_message(msg: Dict):
         logger.info(f"[HANDLE] Applying markup from {data['markup_source']}...")
         text = apply_markup(text, data['markup'])
     
-    # Отправляем текст
     if text and text.strip():
         text_start = time.time()
         ok = await tg.send_text(text)
@@ -963,7 +948,6 @@ async def handle_max_message(msg: Dict):
             logger.info(f"[HANDLE] ✅ Text sent in {text_elapsed:.2f}s")
         await asyncio.sleep(0.3)
     
-    # Отправляем вложения
     for i, att in enumerate(data['attachments']):
         logger.info(f"[HANDLE] Processing attachment {i+1}/{len(data['attachments'])}")
         caption = text if i == 0 and not text else ""
@@ -1037,7 +1021,7 @@ async def health_handler(request):
     return web.json_response({
         'ok': True,
         'service': 'MAX → Telegram Forwarder',
-        'version': 'webhook-final'
+        'version': 'webhook-final-fixed'
     })
 
 
@@ -1046,7 +1030,7 @@ async def health_handler(request):
 # ===================================================================
 async def main():
     """Точка входа."""
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL WEBHOOK VERSION]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL VERSION - FIXED MARKUP]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
