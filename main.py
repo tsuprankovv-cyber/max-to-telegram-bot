@@ -5,7 +5,9 @@ MAX → Telegram Forwarder
 - Графемная конвертация offset (эмодзи не сбивают форматирование)
 - Стековая обработка вложенных тегов
 - Markdown-парсер как fallback
-- Media group для альбомов
+- Гибридная отправка медиа:
+  * Старая схема (прямые URL) для фото-коллажей и одиночных медиа
+  * Новая схема (скачивание + file_id) для фото+видео и видео+видео
 - Приоритет имени файла для аудио
 - Транслитерация кириллицы
 """
@@ -65,7 +67,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL HYBRID VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -182,86 +184,47 @@ def split_into_graphemes(text: str) -> List[str]:
 # 4. КОНВЕРТАЦИЯ РАЗМЕТКИ MAX → HTML
 # ===================================================================
 MAX_TAG_MAP = {
-    # Жирный
-    "strong": "b",
-    "bold": "b",
-    "b": "b",
-    # Курсив
-    "emphasized": "i",
-    "italic": "i",
-    "em": "i",
-    "i": "i",
-    "emphasis": "i",
-    # Подчёркнутый
-    "underline": "u",
-    "u": "u",
-    "ins": "u",
-    # Зачёркнутый
-    "strikethrough": "s",
-    "strike": "s",
-    "s": "s",
-    "del": "s",
-    # Код
-    "code": "code",
-    "inline-code": "code",
-    "pre": "pre",
-    "preformatted": "pre",
-    # Спойлер
+    "strong": "b", "bold": "b", "b": "b",
+    "emphasized": "i", "italic": "i", "em": "i", "i": "i", "emphasis": "i",
+    "underline": "u", "u": "u", "ins": "u",
+    "strikethrough": "s", "strike": "s", "s": "s", "del": "s",
+    "code": "code", "inline-code": "code", "pre": "pre", "preformatted": "pre",
     "spoiler": "tg-spoiler",
-    # Ссылки
-    "link": "a",
-    "text_link": "a",
-    "url": "a",
+    "link": "a", "text_link": "a", "url": "a",
 }
 
 
 def parse_markdown_to_html(text: str) -> str:
-    """
-    Конвертирует Markdown от MAX в HTML для Telegram.
-    """
     if not text:
         return text
-    
     logger.info(f"[MARKDOWN] Parsing markdown...")
-    start_time = time.time()
-    
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
     text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
-    
-    elapsed = time.time() - start_time
-    logger.info(f"[MARKDOWN] ✅ Parsed in {elapsed:.2f}s")
     return text
 
 
 def apply_markup(text: str, markup: List[Dict]) -> str:
-    """
-    Конвертирует разметку MAX в HTML для Telegram.
-    Корректно обрабатывает эмодзи через конвертацию символьных offset в графемные.
-    """
     if not markup or not text:
         return text
     
-    # Проверяем, не "битый" ли markup
     all_from_zero = all(m.get('from', 0) == 0 for m in markup)
     max_length = max((m.get('length', 0) for m in markup), default=0)
     
     if all_from_zero and max_length < len(text):
-        logger.warning(f"[MARKUP] ⚠️ Broken markup (max_length={max_length} < text_len={len(text)}), switching to Markdown.")
+        logger.warning("[MARKUP] ⚠️ Broken markup, switching to Markdown.")
         return parse_markdown_to_html(text)
     
-    logger.info(f"[MARKUP] Converting entities: text_len={len(text)}, entities={len(markup)}")
+    logger.info(f"[MARKUP] Converting: text_len={len(text)}, entities={len(markup)}")
     start_time = time.time()
     
-    # Очищаем Markdown-символы
     cleaned_text = text
     for entity in markup:
         etype = entity.get('type', '')
         offset = entity.get('from', 0)
         length = entity.get('length', 0)
-        
         if etype in ('emphasized', 'italic', 'em', 'i') and offset > 0 and offset + length < len(cleaned_text):
             if cleaned_text[offset-1] == '*' and cleaned_text[offset+length] == '*':
                 cleaned_text = cleaned_text[:offset-1] + cleaned_text[offset:offset+length] + cleaned_text[offset+length+1:]
@@ -273,7 +236,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     graphemes = split_into_graphemes(cleaned_text)
     n = len(graphemes)
     
-    # Маппинг: символ -> графема
     char_to_grapheme = []
     for g_idx, g in enumerate(graphemes):
         char_to_grapheme.extend([g_idx] * len(g))
@@ -303,7 +265,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                 continue
             
             if etype not in MAX_TAG_MAP:
-                logger.debug(f"[MARKUP] Unknown type: '{etype}'")
                 continue
             
             tag_name = MAX_TAG_MAP[etype]
@@ -315,8 +276,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                 if url:
                     url_safe = url.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
                     link_attrs[(offset, tag_name)] = f' href="{url_safe}"'
-            
-            logger.debug(f"[MARKUP] {etype} -> <{tag_name}>: char[{char_offset}:{char_offset+char_length}] -> grapheme[{offset}:{offset+length}]")
             
         except Exception as e:
             logger.error(f"[MARKUP] Error: {e}")
@@ -352,10 +311,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     final_text = ''.join(result)
     elapsed = time.time() - start_time
-    
     logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s")
-    logger.debug(f"[MARKUP] Preview: {final_text[:300]}...")
-    
     return final_text
 
 
@@ -363,9 +319,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
 # 5. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
-    """Извлекает все данные из сообщения MAX."""
     logger.info(f"[EXTRACT] Starting extraction...")
-    logger.debug(f"[EXTRACT] Message keys: {list(msg.keys())}")
     
     link = msg.get('link', {})
     is_forward = False
@@ -390,17 +344,13 @@ def extract_message_data(msg: Dict) -> Dict:
     
     mid = body.get('mid') or inner.get('mid') or msg.get('mid', '')
     
-    result = {
+    return {
         "mid": mid,
         "text": text,
         "markup": markup,
         "attachments": attachments,
         "is_forward": is_forward
     }
-    
-    logger.info(f"[EXTRACT] ✅ mid={mid[:30]}..., text_len={len(text)}, attachments={len(attachments)}, markup={len(markup)}")
-    
-    return result
 
 
 # ===================================================================
@@ -419,7 +369,6 @@ def get_audio_duration(file_path: str) -> int:
 
 
 def safe_audio_tag(tag: str) -> str:
-    """Если тег содержит кириллицу — транслитерирует, иначе оставляет как есть."""
     if not tag:
         return tag
     if re.search(r'[а-яА-Я]', tag):
@@ -428,10 +377,6 @@ def safe_audio_tag(tag: str) -> str:
 
 
 def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
-    """
-    Извлекает метаданные аудиофайла.
-    ПРИОРИТЕТ: Имя файла. Теги добавляются в скобках если есть.
-    """
     logger.info(f"[AUDIO] Extracting tags from: {filename}")
     
     performer = ''
@@ -704,16 +649,15 @@ class TG:
         })
         return resp is not None and resp.get('ok', False)
     
-    async def send_media_group(self, media_items: List[Dict]) -> bool:
-        """Отправляет группу медиа (альбом) одним сообщением."""
+    async def send_media_group_direct(self, media_items: List[Dict]) -> bool:
+        """Старая схема: отправка медиа-группы по прямым URL."""
         if not media_items:
             return True
         
         if len(media_items) > 10:
-            logger.warning(f"[TG] Media group too large ({len(media_items)}), truncating to 10")
             media_items = media_items[:10]
         
-        logger.info(f"[TG] 📤 Sending media group: {len(media_items)} items")
+        logger.info(f"[TG] 📤 Sending media group (direct URLs): {len(media_items)} items")
         
         input_media = []
         for i, item in enumerate(media_items):
@@ -724,40 +668,71 @@ class TG:
             if i == 0 and item.get('caption'):
                 media_obj['caption'] = fix_broken_html(item['caption'])[:1024]
                 media_obj['parse_mode'] = 'HTML'
-            
             input_media.append(media_obj)
         
-        await self.init()
+        resp = await self._request('sendMediaGroup', json={
+            'chat_id': self.chat_id,
+            'media': input_media
+        })
         
-        try:
-            async with self.session.post(
-                f"{self.base}/sendMediaGroup",
-                json={'chat_id': self.chat_id, 'media': input_media}
-            ) as r:
-                txt = await r.text()
-                logger.info(f"[TG] Status: {r.status}")
-                
-                if LOG_RAW_TG:
-                    logger.info(f"[TG-RESP] {txt[:500]}")
-                
-                try:
-                    resp = json.loads(txt)
-                except:
-                    logger.error(f"[TG] ❌ Invalid JSON: {txt[:200]}")
-                    return False
-                
-                if r.status == 200 and resp.get('ok'):
-                    results = resp.get('result', [])
-                    msg_ids = [res.get('message_id') for res in results if isinstance(res, dict)]
-                    logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
-                    return True
+        return resp is not None and resp.get('ok', False)
+    
+    async def send_media_group_via_download(self, media_items: List[Dict], caption: str = None) -> bool:
+        """Новая схема: скачанные файлы -> загрузка в Telegram -> media group по file_id."""
+        if not media_items:
+            return True
+        
+        if len(media_items) > 10:
+            logger.warning(f"[TG] Media group too large ({len(media_items)}), truncating to 10")
+            media_items = media_items[:10]
+        
+        types = [item['type'] for item in media_items]
+        logger.info(f"[TG] 📤 Sending media group (via download): {len(media_items)} items, types={types}")
+        
+        input_media = []
+        for i, item in enumerate(media_items):
+            if item['type'] == 'photo':
+                form = aiohttp.FormData()
+                form.add_field('chat_id', self.chat_id)
+                form.add_field('photo', item['data'], filename=item.get('filename', 'photo.jpg'))
+                upload_resp = await self._request('sendPhoto', data=form)
+                if upload_resp and upload_resp.get('ok'):
+                    file_id = upload_resp['result']['photo'][0]['file_id']
                 else:
-                    logger.error(f"[TG] ❌ Media group failed: {resp.get('description')}")
+                    logger.error(f"[TG] Failed to upload photo for media group")
                     return False
-                    
-        except Exception as e:
-            logger.error(f"[TG] ❌ Exception: {e}")
-            return False
+            elif item['type'] == 'video':
+                form = aiohttp.FormData()
+                form.add_field('chat_id', self.chat_id)
+                form.add_field('video', item['data'], filename=item.get('filename', 'video.mp4'))
+                upload_resp = await self._request('sendVideo', data=form)
+                if upload_resp and upload_resp.get('ok'):
+                    file_id = upload_resp['result']['video']['file_id']
+                else:
+                    logger.error(f"[TG] Failed to upload video for media group")
+                    return False
+            else:
+                continue
+            
+            media_obj = {
+                'type': item['type'],
+                'media': file_id
+            }
+            if i == 0 and caption:
+                media_obj['caption'] = fix_broken_html(caption)[:1024]
+                media_obj['parse_mode'] = 'HTML'
+            input_media.append(media_obj)
+            
+            if upload_resp:
+                msg_id = upload_resp['result']['message_id']
+                await self._request('deleteMessage', json={'chat_id': self.chat_id, 'message_id': msg_id})
+        
+        resp = await self._request('sendMediaGroup', json={
+            'chat_id': self.chat_id,
+            'media': input_media
+        })
+        
+        return resp is not None and resp.get('ok', False)
     
     async def send_media(self, media_type: str, media_data: Union[str, bytes],
                          caption: str = "", filename: str = "", 
@@ -926,87 +901,119 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
 
 
 async def handle_max_message(msg: Dict):
-    """Обрабатывает одно сообщение от MAX с группировкой медиа в альбом."""
+    """Обрабатывает одно сообщение от MAX с гибридной отправкой медиа."""
     start_time = time.time()
     logger.info("=" * 80)
     logger.info(f"[HANDLE] 🚀 Processing MAX message at {time.strftime('%H:%M:%S')}")
-    
+
     if LOG_RAW_MAX:
         logger.debug(f"[HANDLE] Raw message: {json.dumps(msg, ensure_ascii=False)[:1500]}")
-    
+
     data = extract_message_data(msg)
-    
+
     if not data['text'] and not data['attachments']:
         logger.info("[HANDLE] ⏭ Empty message, skipping")
         return
-    
+
     text = data['text']
     if data['markup']:
-        logger.info(f"[HANDLE] Applying entities from MAX markup ({len(data['markup'])} items)...")
+        logger.info(f"[HANDLE] Applying markup ({len(data['markup'])} items)...")
         text = apply_markup(text, data['markup'])
     elif text and ('*' in text or '_' in text or '[' in text):
         logger.info("[HANDLE] 📝 Using Markdown parser...")
         text = parse_markdown_to_html(text)
-    
+
     media_items = []
     other_attachments = []
-    
+
     for att in data['attachments']:
         tg_type, meta = media_proc.determine(att)
-        
         if tg_type in ('photo', 'video'):
-            direct_url = meta.get('url')
-            if direct_url:
-                media_items.append({
-                    'type': tg_type,
-                    'media': direct_url,
-                    'attachment': att,
-                    'meta': meta
-                })
-            else:
-                logger.warning(f"[HANDLE] No URL for {tg_type}, cannot add to media group")
+            media_items.append({'type': tg_type, 'attachment': att, 'meta': meta})
         else:
             other_attachments.append(att)
-    
-    logger.info(f"[HANDLE] Media group items: {len(media_items)}, Other: {len(other_attachments)}")
-    
-    if media_items:
-        group_items = [
-            {
-                'type': item['type'],
-                'media': item['media'],
-                'caption': text if i == 0 else None
-            }
-            for i, item in enumerate(media_items)
-        ]
+
+    logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other_attachments)}")
+
+    # --- ОПРЕДЕЛЯЕМ, НУЖНА ЛИ НОВАЯ СХЕМА ---
+    use_new_scheme = False
+    if len(media_items) > 1:
+        has_video = any(item['type'] == 'video' for item in media_items)
+        has_photo = any(item['type'] == 'photo' for item in media_items)
+        video_count = sum(1 for item in media_items if item['type'] == 'video')
         
-        logger.info(f"[HANDLE] 📸 Sending media group with {len(group_items)} items...")
-        ok = await tg.send_media_group(group_items)
-        
-        if ok:
-            logger.info(f"[HANDLE] ✅ Media group sent successfully")
+        if has_video and (has_photo or video_count >= 2):
+            use_new_scheme = True
+            logger.info(f"[HANDLE] 🔄 Using NEW scheme (download + file_id) for mixed/video group")
         else:
-            logger.warning(f"[HANDLE] Media group failed, sending individually...")
-            for i, item in enumerate(media_items):
-                caption = text if i == 0 else ""
-                await process_attachment(item['attachment'], caption)
-                await asyncio.sleep(0.3)
+            logger.info(f"[HANDLE] 📷 Using OLD scheme (direct URLs) for photo collage")
+    elif len(media_items) == 1:
+        logger.info(f"[HANDLE] 📷 Using OLD scheme (direct URL) for single media")
+
+    if media_items:
+        if use_new_scheme:
+            downloaded_media = []
+            for item in media_items:
+                att = item['attachment']
+                meta = item['meta']
+                direct_url = meta.get('url')
+                if not direct_url:
+                    logger.warning(f"[HANDLE] No URL for {item['type']}, skipping")
+                    continue
+
+                logger.info(f"[HANDLE] 📥 Downloading {item['type']} for reliable group...")
+                file_data = await download_from_url(direct_url)
+                if file_data:
+                    downloaded_media.append({
+                        'type': item['type'],
+                        'data': file_data,
+                        'filename': safe_filename(meta.get('filename', ''))
+                    })
+                else:
+                    logger.error(f"[HANDLE] Failed to download {item['type']}")
+
+            if downloaded_media:
+                ok = await tg.send_media_group_via_download(downloaded_media, text)
+                if ok:
+                    logger.info(f"[HANDLE] ✅ Media group sent successfully (new scheme)")
+                else:
+                    logger.warning(f"[HANDLE] Media group failed, sending individually...")
+                    for i, item in enumerate(downloaded_media):
+                        caption = text if i == 0 else ""
+                        await tg.send_media(item['type'], item['data'], caption=caption, filename=item['filename'])
+                        await asyncio.sleep(0.3)
+        else:
+            group_items = [
+                {
+                    'type': item['type'],
+                    'media': item['meta'].get('url'),
+                    'caption': text if i == 0 else None
+                }
+                for i, item in enumerate(media_items)
+                if item['meta'].get('url')
+            ]
+            
+            if group_items:
+                logger.info(f"[HANDLE] 📸 Sending media group with {len(group_items)} items (old scheme)...")
+                ok = await tg.send_media_group_direct(group_items)
+                if ok:
+                    logger.info(f"[HANDLE] ✅ Media group sent successfully (old scheme)")
+                else:
+                    logger.warning(f"[HANDLE] Media group failed, sending individually...")
+                    for i, item in enumerate(media_items):
+                        caption = text if i == 0 else ""
+                        await process_attachment(item['attachment'], caption)
+                        await asyncio.sleep(0.3)
     else:
         if text and text.strip():
-            text_start = time.time()
-            ok = await tg.send_text(text)
-            text_elapsed = time.time() - text_start
-            if not ok:
-                logger.error(f"[HANDLE] ❌ Failed to send text in {text_elapsed:.2f}s")
-            else:
-                logger.info(f"[HANDLE] ✅ Text sent in {text_elapsed:.2f}s")
+            await tg.send_text(text)
             await asyncio.sleep(0.3)
-    
+
     for i, att in enumerate(other_attachments):
         logger.info(f"[HANDLE] Processing other attachment {i+1}/{len(other_attachments)}")
         await process_attachment(att, "")
         await asyncio.sleep(0.5)
-    
+
     elapsed = time.time() - start_time
     logger.info(f"[HANDLE] ✅ Message processing complete in {elapsed:.2f}s")
     logger.info("=" * 80)
@@ -1064,7 +1071,7 @@ async def health_handler(request):
     return web.json_response({
         'ok': True,
         'service': 'MAX → Telegram Forwarder',
-        'version': 'final'
+        'version': 'final-hybrid'
     })
 
 
@@ -1072,7 +1079,7 @@ async def health_handler(request):
 # 13. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL VERSION]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL HYBRID VERSION]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
