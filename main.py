@@ -2,10 +2,12 @@
 """
 MAX → Telegram Forwarder
 ФИНАЛЬНАЯ ВЕРСИЯ
-- Полная поддержка форматирования MAX (включая emphasized → курсив)
-- Защита от "битого" markup (переключение на Markdown-парсер)
+- Полная поддержка форматирования MAX (Markdown)
+- Отправка альбомов (media group) для нескольких фото/видео
+- Текст приклеивается к первому медиа в альбоме
+- Приоритет имени файла для аудио, теги в скобках
+- Транслитерация всех кириллических имён
 - Прямые ссылки для скачивания
-- Транслитерация имён файлов
 - Максимальное логирование
 """
 import os
@@ -200,23 +202,18 @@ MAX_TAG_MAP = {
 def parse_markdown_to_html(text: str) -> str:
     """
     Конвертирует Markdown от MAX в HTML для Telegram.
-    Включается, когда markup от MAX невалидный (все offset=0).
+    Поддерживает: **жирный**, *курсив*, ++подчёркнутый++, ~~зачёркнутый~~, [ссылка](url)
     """
     if not text:
         return text
     
-    logger.info(f"[MARKDOWN] Falling back to Markdown parsing...")
+    logger.info(f"[MARKDOWN] Parsing markdown...")
     start_time = time.time()
     
-    # Жирный: **текст**
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    # Курсив: *текст* (но не **)
-    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', r'<i>\1</i>', text)
-    # Подчёркнутый: ++текст++
+    text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
     text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
-    # Зачёркнутый: ~~текст~~
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
-    # Ссылки: [текст](url)
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
     
     elapsed = time.time() - start_time
@@ -232,9 +229,8 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text:
         return text
     
-    # ПРОВЕРКА НА "БИТУЮ" РАЗМЕТКУ MAX (все from=0)
     if all(m.get('from', 0) == 0 for m in markup):
-        logger.warning("[MARKUP] ⚠️ Detected broken MAX markup (all offsets=0). Switching to Markdown parser.")
+        logger.warning("[MARKUP] ⚠️ Detected broken MAX markup, switching to Markdown.")
         return parse_markdown_to_html(text)
     
     logger.info(f"[MARKUP] Converting entities: text_len={len(text)}, entities={len(markup)}")
@@ -257,7 +253,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                 continue
             
             if etype not in MAX_TAG_MAP:
-                logger.debug(f"[MARKUP] Unknown type: '{etype}'")
                 continue
             
             tag_name = MAX_TAG_MAP[etype]
@@ -307,7 +302,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     final_text = ''.join(result)
     elapsed = time.time() - start_time
     
-    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s: {len(text)} → {len(final_text)} chars")
+    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s")
     logger.debug(f"[MARKUP] Preview: {final_text[:200]}...")
     
     return final_text
@@ -372,7 +367,22 @@ def get_audio_duration(file_path: str) -> int:
     return 0
 
 
+def safe_audio_tag(tag: str) -> str:
+    """Если тег содержит кириллицу — транслитерирует, иначе оставляет как есть."""
+    if not tag:
+        return tag
+    if re.search(r'[а-яА-Я]', tag):
+        return transliterate_ru_to_en(tag)
+    return tag
+
+
 def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
+    """
+    Извлекает метаданные аудиофайла.
+    ПРИОРИТЕТ: Имя файла. Теги добавляются в скобках если есть.
+    """
+    logger.info(f"[AUDIO] Extracting tags from: {filename}")
+    
     performer = ''
     title = ''
     duration = 0
@@ -405,19 +415,37 @@ def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
     
     os.unlink(tmp_path)
     
-    safe_name = safe_filename(filename)
-    name = safe_name.rsplit('.', 1)[0] if '.' in safe_name else safe_name
+    performer_tag = safe_audio_tag(performer)
+    title_tag = safe_audio_tag(title)
     
-    if ' - ' in name:
-        parts = name.split(' - ', 1)
-        performer = performer or parts[0].strip()
-        title = title or parts[1].strip()
+    base_filename = safe_filename(filename)
+    base_name = base_filename.rsplit('.', 1)[0] if '.' in base_filename else base_filename
+    
+    if performer_tag and title_tag:
+        final_performer = base_name
+        final_title = f"{title_tag} ({performer_tag})"
+    elif performer_tag:
+        final_performer = base_name
+        final_title = performer_tag
+    elif title_tag:
+        final_performer = base_name
+        final_title = title_tag
     else:
-        title = title or name.strip()
-        performer = performer or 'Unknown Artist'
+        if ' - ' in base_name:
+            parts = base_name.split(' - ', 1)
+            final_performer = parts[0].strip()
+            final_title = parts[1].strip()
+        else:
+            final_performer = 'Unknown Artist'
+            final_title = base_name
     
-    logger.info(f"[AUDIO] Tags: performer='{performer}', title='{title}', duration={duration}s")
-    return {'performer': performer[:64], 'title': title[:64], 'duration': duration}
+    logger.info(f"[AUDIO] ✅ Final: performer='{final_performer}', title='{final_title}', duration={duration}s")
+    
+    return {
+        'performer': final_performer[:64],
+        'title': final_title[:64],
+        'duration': duration
+    }
 
 
 def convert_to_voice(file_data: bytes) -> Optional[bytes]:
@@ -625,6 +653,48 @@ class TG:
         })
         return resp is not None and resp.get('ok', False)
     
+    async def send_media_group(self, media_items: List[Dict]) -> bool:
+        """
+        Отправляет группу медиа (альбом) одним сообщением.
+        media_items: список словарей с ключами:
+            - type: 'photo' или 'video'
+            - media: строка (URL или file_id)
+            - caption: строка (только для первого элемента)
+        """
+        if not media_items:
+            return True
+        
+        if len(media_items) > 10:
+            logger.warning(f"[TG] Media group too large ({len(media_items)}), truncating to 10")
+            media_items = media_items[:10]
+        
+        logger.info(f"[TG] 📤 Sending media group: {len(media_items)} items")
+        
+        input_media = []
+        for i, item in enumerate(media_items):
+            media_obj = {
+                'type': item['type'],
+                'media': item['media']
+            }
+            if i == 0 and item.get('caption'):
+                media_obj['caption'] = fix_broken_html(item['caption'])[:1024]
+                media_obj['parse_mode'] = 'HTML'
+            
+            input_media.append(media_obj)
+        
+        resp = await self._request('sendMediaGroup', json={
+            'chat_id': self.chat_id,
+            'media': input_media
+        })
+        
+        if resp and resp.get('ok'):
+            results = resp.get('result', [])
+            msg_ids = [r.get('message_id') for r in results if isinstance(r, dict)]
+            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
+            return True
+        
+        return False
+    
     async def send_media(self, media_type: str, media_data: Union[str, bytes],
                          caption: str = "", filename: str = "", 
                          is_url: bool = False, **extra) -> bool:
@@ -792,6 +862,7 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
 
 
 async def handle_max_message(msg: Dict):
+    """Обрабатывает одно сообщение от MAX с группировкой медиа в альбом."""
     start_time = time.time()
     logger.info("=" * 80)
     logger.info(f"[HANDLE] 🚀 Processing MAX message at {time.strftime('%H:%M:%S')}")
@@ -807,26 +878,77 @@ async def handle_max_message(msg: Dict):
     
     text = data['text']
     if data['markup']:
-        logger.info(f"[HANDLE] Applying markup ({len(data['markup'])} items)...")
+        logger.info(f"[HANDLE] Applying entities from MAX markup ({len(data['markup'])} items)...")
         text = apply_markup(text, data['markup'])
-    elif text and ('**' in text or '*' in text or '__' in text or '++' in text or '[' in text):
-        logger.info("[HANDLE] 📝 Trying Markdown parsing...")
+    elif text:
+        logger.info("[HANDLE] 📝 Using Markdown parser...")
         text = parse_markdown_to_html(text)
     
-    if text and text.strip():
-        text_start = time.time()
-        ok = await tg.send_text(text)
-        text_elapsed = time.time() - text_start
-        if not ok:
-            logger.error(f"[HANDLE] ❌ Failed to send text in {text_elapsed:.2f}s")
-        else:
-            logger.info(f"[HANDLE] ✅ Text sent in {text_elapsed:.2f}s")
-        await asyncio.sleep(0.3)
+    media_items = []
+    other_attachments = []
     
-    for i, att in enumerate(data['attachments']):
-        logger.info(f"[HANDLE] Processing attachment {i+1}/{len(data['attachments'])}")
-        caption = text if i == 0 and not text else ""
-        await process_attachment(att, caption)
+    for att in data['attachments']:
+        tg_type, meta = media_proc.determine(att)
+        
+        if tg_type in ('photo', 'video'):
+            direct_url = meta.get('url')
+            if direct_url:
+                media_items.append({
+                    'type': tg_type,
+                    'media': direct_url,
+                    'attachment': att,
+                    'meta': meta
+                })
+            else:
+                logger.warning(f"[HANDLE] No URL for {tg_type}, cannot add to media group")
+        else:
+            other_attachments.append(att)
+    
+    logger.info(f"[HANDLE] Media group items: {len(media_items)}, Other: {len(other_attachments)}")
+    
+    if media_items:
+        can_use_urls = all(item['type'] in ('photo', 'video') for item in media_items)
+        
+        if can_use_urls:
+            group_items = [
+                {
+                    'type': item['type'],
+                    'media': item['media'],
+                    'caption': text if i == 0 else None
+                }
+                for i, item in enumerate(media_items)
+            ]
+            
+            logger.info(f"[HANDLE] 📸 Sending media group with {len(group_items)} items...")
+            ok = await tg.send_media_group(group_items)
+            
+            if ok:
+                logger.info(f"[HANDLE] ✅ Media group sent successfully")
+            else:
+                logger.warning(f"[HANDLE] Media group failed, sending individually...")
+                for i, item in enumerate(media_items):
+                    caption = text if i == 0 else ""
+                    await process_attachment(item['attachment'], caption)
+                    await asyncio.sleep(0.3)
+        else:
+            for i, item in enumerate(media_items):
+                caption = text if i == 0 else ""
+                await process_attachment(item['attachment'], caption)
+                await asyncio.sleep(0.3)
+    else:
+        if text and text.strip():
+            text_start = time.time()
+            ok = await tg.send_text(text)
+            text_elapsed = time.time() - text_start
+            if not ok:
+                logger.error(f"[HANDLE] ❌ Failed to send text in {text_elapsed:.2f}s")
+            else:
+                logger.info(f"[HANDLE] ✅ Text sent in {text_elapsed:.2f}s")
+            await asyncio.sleep(0.3)
+    
+    for i, att in enumerate(other_attachments):
+        logger.info(f"[HANDLE] Processing other attachment {i+1}/{len(other_attachments)}")
+        await process_attachment(att, "")
         await asyncio.sleep(0.5)
     
     elapsed = time.time() - start_time
