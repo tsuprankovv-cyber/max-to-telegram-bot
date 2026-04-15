@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ
-- Правильная обработка вложенных и пересекающихся тегов (LIFO)
+ФИНАЛЬНАЯ ВЕРСИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ
+- Стековая обработка вложенности тегов (LIFO)
 - Прямые offset без графем (эмодзи не сбивают)
-- Исправлены дубли при отправке одиночного фото
-- Гибридная отправка медиа (старая/новая схема)
-- Приоритет имени файла для аудио
-- Транслитерация кириллицы
-- Полное логирование ответов Telegram
+- Исправлены дубли при одиночном фото
+- Гибридная отправка медиа
+- Полное логирование запросов и ответов
 """
 import os
 import sys
@@ -28,7 +26,7 @@ from aiohttp import web
 from mutagen import File as MutagenFile
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (МАКСИМАЛЬНОЕ)
 # ===================================================================
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 LOG_RAW_MAX = os.getenv('LOG_RAW_MAX', '1') == '1'
@@ -39,7 +37,7 @@ LOG_MEDIA = os.getenv('LOG_MEDIA', '1') == '1'
 file_handler = RotatingFileHandler(
     'bot_debug.log',
     maxBytes=10*1024*1024,
-    backupCount=3,
+    backupCount=5,
     encoding='utf-8'
 )
 file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
@@ -66,7 +64,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION - LIFO MARKUP]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL FULL-LOG VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -82,36 +80,25 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===================================================================
 def fix_broken_html(text: str) -> str:
-    """Исправляет незакрытые HTML теги перед отправкой в Telegram."""
-    if not text:
-        return text
-    
-    tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 
-            'code', 'pre', 'a', 'tg-spoiler']
-    
+    if not text: return text
+    tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'a', 'tg-spoiler']
     fixed = text
     for tag in tags:
         open_pattern = f'<{tag}[^>]*>'
         close_pattern = f'</{tag}>'
-        
         open_count = len(re.findall(open_pattern, fixed, re.IGNORECASE))
         close_count = len(re.findall(close_pattern, fixed, re.IGNORECASE))
-        
         if open_count > close_count:
             fixed += f'</{tag}>' * (open_count - close_count)
         elif close_count > open_count:
             fixed = re.sub(close_pattern, f'&lt;/{tag}&gt;', fixed, flags=re.IGNORECASE)
-    
     open_a = len(re.findall(r'<a\s+[^>]*>', fixed, re.IGNORECASE))
     close_a = len(re.findall(r'</a>', fixed, re.IGNORECASE))
     if open_a > close_a:
         fixed += '</a>' * (open_a - close_a)
-    
     return fixed
 
-
 def transliterate_ru_to_en(text: str) -> str:
-    """Транслитерирует русский текст в латиницу."""
     mapping = {
         'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'yo',
         'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm',
@@ -124,50 +111,34 @@ def transliterate_ru_to_en(text: str) -> str:
         'Ф': 'F', 'Х': 'Kh', 'Ц': 'Ts', 'Ч': 'Ch', 'Ш': 'Sh', 'Щ': 'Sch',
         'Ъ': '', 'Ы': 'Y', 'Ь': '', 'Э': 'E', 'Ю': 'Yu', 'Я': 'Ya'
     }
-    result = ''
-    for char in text:
-        result += mapping.get(char, char)
+    result = ''.join(mapping.get(c, c) for c in text)
     result = re.sub(r'[^a-zA-Z0-9._-]', '_', result)
     result = re.sub(r'_+', '_', result)
     return result.strip('._')
 
-
 def safe_filename(filename: str) -> str:
-    """Создаёт безопасное имя файла с транслитерацией."""
-    if not filename:
-        return 'file'
-    if '.' in filename:
-        name, ext = filename.rsplit('.', 1)
-    else:
-        name, ext = filename, ''
-    safe_name = transliterate_ru_to_en(name)
-    if not safe_name:
-        safe_name = 'file'
-    if len(safe_name) > 100:
-        safe_name = safe_name[:100]
-    if ext:
-        return f"{safe_name}.{ext}"
-    return safe_name
-
+    if not filename: return 'file'
+    name, ext = (filename.rsplit('.', 1) + [''])[:2]
+    safe_name = transliterate_ru_to_en(name) or 'file'
+    if len(safe_name) > 100: safe_name = safe_name[:100]
+    return f"{safe_name}.{ext}" if ext else safe_name
 
 # ===================================================================
-# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ MAX → HTML (СТЕКОВАЯ ОБРАБОТКА)
+# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (СТЕК LIFO, БЕЗ ГРАФЕМ)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
-    "emphasized": "i", "italic": "i", "em": "i", "i": "i", "emphasis": "i",
+    "emphasized": "i", "italic": "i", "em": "i", "i": "i",
     "underline": "u", "u": "u", "ins": "u",
     "strikethrough": "s", "strike": "s", "s": "s", "del": "s",
-    "code": "code", "inline-code": "code", "pre": "pre", "preformatted": "pre",
+    "code": "code", "inline-code": "code", "pre": "pre",
     "spoiler": "tg-spoiler",
     "link": "a", "text_link": "a", "url": "a",
 }
 
-
 def parse_markdown_to_html(text: str) -> str:
-    if not text:
-        return text
-    logger.info(f"[MARKDOWN] Parsing markdown...")
+    if not text: return text
+    logger.info("[MARKDOWN] Parsing markdown...")
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
     text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
@@ -175,18 +146,12 @@ def parse_markdown_to_html(text: str) -> str:
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
     return text
 
-
 def apply_markup(text: str, markup: List[Dict]) -> str:
-    """
-    Конвертирует разметку MAX в HTML для Telegram.
-    Использует стековую обработку для правильной вложенности тегов.
-    """
-    if not markup or not text:
-        return text
+    if not markup or not text: return text
     
+    # Проверка на битый markup
     all_from_zero = all(m.get('from', 0) == 0 for m in markup)
     max_length = max((m.get('length', 0) for m in markup), default=0)
-    
     if all_from_zero and max_length < len(text):
         logger.warning("[MARKUP] ⚠️ Broken markup, switching to Markdown.")
         return parse_markdown_to_html(text)
@@ -194,56 +159,40 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     logger.info(f"[MARKUP] Converting: text_len={len(text)}, entities={len(markup)}")
     start_time = time.time()
     
-    # Создаём события открытия и закрытия тегов
     events = []
     for idx, entity in enumerate(markup):
         try:
             offset = int(entity.get('from', 0))
             length = int(entity.get('length', 0))
             etype = entity.get('type', '')
-            
-            if offset < 0 or length <= 0 or offset + length > len(text):
-                continue
-            
-            if etype not in MAX_TAG_MAP:
-                continue
+            if offset < 0 or length <= 0 or offset + length > len(text): continue
+            if etype not in MAX_TAG_MAP: continue
             
             tag_name = MAX_TAG_MAP[etype]
-            
             if etype in ('link', 'text_link', 'url'):
-                url = entity.get('url') or entity.get('href') or ''
-                if url:
-                    url_safe = url.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-                    open_tag = f'<{tag_name} href="{url_safe}">'
-                else:
-                    open_tag = f'<{tag_name}>'
+                url = entity.get('url', '').replace('"', '&quot;')
+                open_tag = f'<{tag_name} href="{url}">' if url else f'<{tag_name}>'
             else:
                 open_tag = f'<{tag_name}>'
-            
             close_tag = f'</{tag_name}>'
             
             events.append((offset, 'open', open_tag, close_tag, idx))
             events.append((offset + length, 'close', open_tag, close_tag, idx))
-            
             logger.debug(f"[MARKUP] {etype}: [{offset}:{offset+length}] -> <{tag_name}>")
-            
         except Exception as e:
             logger.error(f"[MARKUP] Error: {e}")
-    
-    # Сортируем: сначала по позиции, закрывающие перед открывающими
+
     events.sort(key=lambda x: (x[0], 0 if x[1] == 'close' else 1, -x[4]))
     
     result = []
-    open_stack = []  # Стек открытых тегов: [(close_tag, priority), ...]
+    open_stack = []
     event_idx = 0
     n = len(text)
     
     for pos in range(n + 1):
-        # Обрабатываем все события на текущей позиции
         while event_idx < len(events) and events[event_idx][0] == pos:
             _, etype, open_tag, close_tag, priority = events[event_idx]
             if etype == 'close':
-                # Ищем соответствующий открывающий тег в стеке
                 for i in range(len(open_stack) - 1, -1, -1):
                     if open_stack[i][0] == close_tag and open_stack[i][1] == priority:
                         result.append(close_tag)
@@ -253,151 +202,81 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                 open_stack.append((close_tag, priority))
                 result.append(open_tag)
             event_idx += 1
-        
-        # Добавляем символ
         if pos < n:
             result.append(text[pos])
-    
-    # Закрываем оставшиеся теги
+            
     for close_tag, _ in reversed(open_stack):
         result.append(close_tag)
-    
+        
     final_text = ''.join(result)
-    elapsed = time.time() - start_time
-    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s: {len(text)} → {len(final_text)} chars")
+    logger.info(f"[MARKUP] ✅ Converted in {time.time() - start_time:.2f}s")
     logger.debug(f"[MARKUP] Preview: {final_text[:200]}...")
-    
     return final_text
-
 
 # ===================================================================
 # 5. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
-    logger.info(f"[EXTRACT] Starting extraction...")
-    
+    logger.info("[EXTRACT] Starting extraction...")
     link = msg.get('link', {})
-    is_forward = False
-    if isinstance(link, dict) and link.get('type') == 'forward' and 'message' in link:
-        logger.info(f"[EXTRACT] 📨 This is a FORWARDED message")
-        inner = link['message']
-        is_forward = True
-    else:
-        inner = msg
+    is_forward = isinstance(link, dict) and link.get('type') == 'forward' and 'message' in link
+    inner = link['message'] if is_forward else msg
     
     body = inner.get('body', {})
-    if not isinstance(body, dict):
-        body = {}
-    
     text = body.get('text', '') or inner.get('text', '')
     markup = body.get('markup', []) or inner.get('markup', [])
     
-    attachments = []
     att_list = body.get('attachments') or inner.get('attachments') or []
-    if isinstance(att_list, list):
-        attachments = [a for a in att_list if isinstance(a, dict)]
-    
-    mid = body.get('mid') or inner.get('mid') or msg.get('mid', '')
+    attachments = [a for a in att_list if isinstance(a, dict)]
     
     return {
-        "mid": mid,
+        "mid": body.get('mid') or inner.get('mid', ''),
         "text": text,
         "markup": markup,
         "attachments": attachments,
         "is_forward": is_forward
     }
 
-
 # ===================================================================
 # 6. АУДИО УТИЛИТЫ
 # ===================================================================
 def get_audio_duration(file_path: str) -> int:
     try:
-        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-               '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', file_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            return int(float(result.stdout.strip()))
-    except:
-        pass
+        if result.returncode == 0: return int(float(result.stdout.strip()))
+    except: pass
     return 0
 
-
-def safe_audio_tag(tag: str) -> str:
-    if not tag:
-        return tag
-    if re.search(r'[а-яА-Я]', tag):
-        return transliterate_ru_to_en(tag)
-    return tag
-
-
 def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
-    logger.info(f"[AUDIO] Extracting tags from: {filename}")
-    
-    performer = ''
-    title = ''
-    duration = 0
-    
+    performer, title, duration = '', '', 0
     with tempfile.NamedTemporaryFile(suffix='.tmp', delete=False) as tmp:
         tmp.write(file_data)
         tmp_path = tmp.name
     
     try:
         audio = MutagenFile(tmp_path)
-        if audio:
-            if hasattr(audio, 'info') and hasattr(audio.info, 'length'):
-                duration = int(audio.info.length)
-            if hasattr(audio, 'tags'):
-                tags = audio.tags
-                if tags:
-                    if 'TPE1' in tags:
-                        performer = str(tags['TPE1'])
-                    elif '©ART' in tags:
-                        performer = str(tags['©ART'])
-                    if 'TIT2' in tags:
-                        title = str(tags['TIT2'])
-                    elif '©nam' in tags:
-                        title = str(tags['©nam'])
-    except:
-        pass
+        if audio and hasattr(audio, 'info') and audio.info: duration = int(audio.info.length or 0)
+        if audio and hasattr(audio, 'tags') and audio.tags:
+            tags = audio.tags
+            performer = str(tags.get('TPE1', tags.get('©ART', '')))
+            title = str(tags.get('TIT2', tags.get('©nam', '')))
+    except: pass
     
-    if duration == 0 and os.path.exists(tmp_path):
-        duration = get_audio_duration(tmp_path)
-    
+    if not duration: duration = get_audio_duration(tmp_path)
     os.unlink(tmp_path)
     
-    performer_tag = safe_audio_tag(performer)
-    title_tag = safe_audio_tag(title)
-    
-    base_filename = safe_filename(filename)
-    base_name = base_filename.rsplit('.', 1)[0] if '.' in base_filename else base_filename
-    
-    if performer_tag and title_tag:
-        final_performer = base_name
-        final_title = f"{title_tag} ({performer_tag})"
-    elif performer_tag:
-        final_performer = base_name
-        final_title = performer_tag
-    elif title_tag:
-        final_performer = base_name
-        final_title = title_tag
-    else:
-        if ' - ' in base_name:
-            parts = base_name.split(' - ', 1)
-            final_performer = parts[0].strip()
-            final_title = parts[1].strip()
-        else:
-            final_performer = 'Unknown Artist'
-            final_title = base_name
+    base_name = safe_filename(filename).rsplit('.', 1)[0]
+    final_performer, final_title = base_name, ''
+    if performer and title: final_title = f"{title} ({performer})"
+    elif performer: final_title = performer
+    elif title: final_title = title
+    elif ' - ' in base_name:
+        parts = base_name.split(' - ', 1)
+        final_performer, final_title = parts[0].strip(), parts[1].strip()
     
     logger.info(f"[AUDIO] ✅ Final: performer='{final_performer}', title='{final_title}', duration={duration}s")
-    
-    return {
-        'performer': final_performer[:64],
-        'title': final_title[:64],
-        'duration': duration
-    }
-
+    return {'performer': final_performer[:64], 'title': final_title[:64], 'duration': duration}
 
 def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     try:
@@ -406,74 +285,43 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
         logger.error("[VOICE] ❌ FFmpeg not available")
         return None
     
-    try:
-        with tempfile.NamedTemporaryFile(suffix='.tmp', delete=False) as tmp_in:
-            tmp_in.write(file_data)
-            tmp_in_path = tmp_in.name
+    with tempfile.NamedTemporaryFile(suffix='.tmp', delete=False) as tmp_in, \
+         tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp_out:
+        tmp_in.write(file_data)
+        tmp_in_path, tmp_out_path = tmp_in.name, tmp_out.name
         
-        with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp_out:
-            tmp_out_path = tmp_out.name
-        
-        cmd = [
-            'ffmpeg', '-i', tmp_in_path,
-            '-ac', '1', '-ar', '16000', '-c:a', 'libopus',
-            '-b:a', '16k', '-vbr', 'on', '-application', 'voip',
-            '-y', tmp_out_path
-        ]
-        
-        logger.info(f"[VOICE] 🎤 Converting: {len(file_data)} bytes -> OGG Opus...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        
-        if result.returncode != 0:
-            logger.error(f"[VOICE] ❌ FFmpeg error")
-            os.unlink(tmp_in_path)
-            return None
-        
-        with open(tmp_out_path, 'rb') as f:
-            ogg_data = f.read()
-        
+    cmd = ['ffmpeg', '-i', tmp_in_path, '-ac', '1', '-ar', '16000', '-c:a', 'libopus', '-b:a', '16k', '-vbr', 'on', '-application', 'voip', '-y', tmp_out_path]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    
+    if result.returncode != 0:
+        logger.error(f"[VOICE] ❌ FFmpeg error: {result.stderr[:200]}")
         os.unlink(tmp_in_path)
-        os.unlink(tmp_out_path)
-        
-        logger.info(f"[VOICE] ✅ Converted: {len(file_data)} -> {len(ogg_data)} bytes")
-        return ogg_data
-        
-    except Exception as e:
-        logger.error(f"[VOICE] ❌ Exception: {e}")
         return None
-
+    
+    with open(tmp_out_path, 'rb') as f: ogg_data = f.read()
+    os.unlink(tmp_in_path); os.unlink(tmp_out_path)
+    logger.info(f"[VOICE] ✅ Converted: {len(file_data)} -> {len(ogg_data)} bytes")
+    return ogg_data
 
 # ===================================================================
-# 7. СКАЧИВАНИЕ ПО ПРЯМОЙ ССЫЛКЕ
+# 7. СКАЧИВАНИЕ ПО URL
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
-    if not url:
-        logger.error("[DOWNLOAD] ❌ Empty URL")
-        return None
-    
-    logger.info(f"[DOWNLOAD] 📥 Downloading from: {url[:100]}...")
+    if not url: return None
+    logger.info(f"[DOWNLOAD] 📥 Downloading: {url[:100]}...")
     start_time = time.time()
-    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
-                elapsed = time.time() - start_time
-                
                 if r.status == 200:
                     data = await r.read()
-                    logger.info(f"[DOWNLOAD] ✅ Downloaded {len(data)} bytes in {elapsed:.2f}s")
+                    logger.info(f"[DOWNLOAD] ✅ {len(data)} bytes in {time.time() - start_time:.2f}s")
                     return data
-                else:
-                    text = await r.text()
-                    logger.error(f"[DOWNLOAD] ❌ HTTP {r.status} in {elapsed:.2f}s: {text[:200]}")
-                    return None
-    except asyncio.TimeoutError:
-        logger.error(f"[DOWNLOAD] ❌ Timeout after 120s")
-        return None
+                logger.error(f"[DOWNLOAD] ❌ HTTP {r.status}")
+                return None
     except Exception as e:
-        logger.error(f"[DOWNLOAD] ❌ Exception: {e}")
+        logger.error(f"[DOWNLOAD] ❌ {e}")
         return None
-
 
 # ===================================================================
 # 8. MEDIA PROCESSOR
@@ -486,245 +334,134 @@ class MediaProcessor:
     
     def __init__(self):
         self.ffmpeg_ok = self._check_ffmpeg()
-        logger.info(f"[MEDIA] FFmpeg available: {self.ffmpeg_ok}")
+        logger.info(f"[MEDIA] FFmpeg: {self.ffmpeg_ok}")
     
     def _check_ffmpeg(self) -> bool:
-        try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-            return True
-        except:
-            return False
+        try: subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True); return True
+        except: return False
     
     def determine(self, att: Dict) -> Tuple[str, Dict]:
-        atype = att.get('type') or att.get('media_type') or 'file'
+        atype = att.get('type', 'file')
         payload = att.get('payload', {})
-        
-        fname = payload.get('filename') or att.get('filename') or ''
-        size = payload.get('size') or att.get('size') or 0
-        url = payload.get('url')
-        token = payload.get('token') or att.get('token') or att.get('file_token')
+        fname = payload.get('filename') or att.get('filename', '')
         ext = fname.split('.')[-1].lower() if '.' in fname else ''
+        meta = {'filename': fname, 'size': payload.get('size', 0), 'url': payload.get('url'), 'token': payload.get('token'), 'ext': ext, 'original_type': atype}
         
-        logger.info(f"[MEDIA] 🔍 Analyzing: atype='{atype}', ext='{ext}', size={size}, filename='{fname}'")
+        logger.info(f"[MEDIA] 🔍 atype='{atype}', ext='{ext}'")
+        if LOG_MEDIA: logger.debug(f"[MEDIA] Full: {json.dumps(att, ensure_ascii=False)[:500]}")
         
-        if LOG_MEDIA:
-            logger.debug(f"[MEDIA] Full attachment: {json.dumps(att, ensure_ascii=False)[:500]}")
+        if atype == 'voice': return 'voice', meta
+        if atype == 'audio': return 'audio', meta
+        if atype == 'video': return 'video', meta
+        if atype in ('image', 'photo'): return 'photo', meta
         
-        meta = {
-            'filename': fname,
-            'size': size,
-            'url': url,
-            'token': token,
-            'ext': ext,
-            'original_type': atype
-        }
-        
-        if atype == 'voice':
-            return 'voice', meta
-        if atype == 'audio':
-            return 'audio', meta
-        if atype == 'video':
-            return 'video', meta
-        if atype in ('image', 'photo', 'picture'):
-            return 'photo', meta
-        
-        if ext in self.VOICE_EXTS:
-            return 'voice', meta
-        if ext in self.AUDIO_EXTS:
-            return 'audio', meta
-        if ext in self.PHOTO_EXTS:
-            return 'photo', meta
-        if ext in self.VIDEO_EXTS:
-            return 'video', meta
-        
+        if ext in self.VOICE_EXTS: return 'voice', meta
+        if ext in self.AUDIO_EXTS: return 'audio', meta
+        if ext in self.PHOTO_EXTS: return 'photo', meta
+        if ext in self.VIDEO_EXTS: return 'video', meta
         return 'document', meta
 
-
 # ===================================================================
-# 9. TELEGRAM CLIENT (С ПОЛНЫМ ЛОГИРОВАНИЕМ)
+# 9. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
+        self.token, self.chat_id = token, chat_id
         self.base = f"https://api.telegram.org/bot{token}"
         self.session = None
     
     async def init(self):
-        if not self.session:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
+        if not self.session: self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120))
     
     async def _request(self, method: str, **kw) -> Optional[Dict]:
         await self.init()
         logger.info(f"[TG] ▶️ {method}")
+        if LOG_RAW_TG: logger.debug(f"[TG-REQ] {json.dumps(kw, default=str, ensure_ascii=False)[:500]}")
         
         try:
             async with self.session.post(f"{self.base}/{method}", **kw) as r:
                 txt = await r.text()
                 logger.info(f"[TG] Status: {r.status}")
+                logger.info(f"[TG-RESP] {txt}")  # ПОЛНЫЙ ОТВЕТ
                 
-                if LOG_RAW_TG:
-                    logger.info(f"[TG-RESP] {txt}")  # ПОЛНЫЙ ОТВЕТ БЕЗ ОБРЕЗКИ
-                
-                try:
-                    resp = json.loads(txt)
-                except:
-                    logger.error(f"[TG] ❌ Invalid JSON: {txt[:200]}")
-                    return None
-                
+                resp = json.loads(txt)
                 if r.status == 200 and resp.get('ok'):
-                    msg_id = resp.get('result', {}).get('message_id')
-                    logger.info(f"[TG] ✅ Success: message_id={msg_id}")
+                    logger.info(f"[TG] ✅ Success: msg_id={resp.get('result', {}).get('message_id')}")
                     return resp
                 elif r.status == 429:
                     wait = resp.get('parameters', {}).get('retry_after', 10)
-                    logger.warning(f"[TG] ⏳ Rate limit, waiting {wait}s...")
+                    logger.warning(f"[TG] ⏳ Rate limit, wait {wait}s")
                     await asyncio.sleep(wait)
                     return await self._request(method, **kw)
                 else:
-                    logger.error(f"[TG] ❌ Error {resp.get('error_code')}: {resp.get('description')}")
+                    logger.error(f"[TG] ❌ {resp.get('description')}")
                     return resp
-                    
         except Exception as e:
-            logger.error(f"[TG] ❌ Exception: {e}")
+            logger.error(f"[TG] ❌ {e}")
             return None
-    
+
     async def send_text(self, text: str) -> bool:
-        if not text or not text.strip():
-            return True
-        
+        if not text: return True
         text = fix_broken_html(text)
-        logger.info(f"[TG] 📤 Sending text: {text[:100]}...")
-        
-        resp = await self._request('sendMessage', json={
-            'chat_id': self.chat_id,
-            'text': text,
-            'parse_mode': 'HTML',
-            'disable_web_page_preview': False
-        })
-        return resp is not None and resp.get('ok', False)
-    
-    async def send_media_group_direct(self, media_items: List[Dict]) -> bool:
-        """Старая схема: отправка медиа-группы по прямым URL."""
-        if not media_items:
-            return True
-        
-        if len(media_items) > 10:
-            media_items = media_items[:10]
-        
-        logger.info(f"[TG] 📤 Sending media group (direct URLs): {len(media_items)} items")
+        logger.info(f"[TG] 📤 Text: {text[:100]}...")
+        resp = await self._request('sendMessage', json={'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML'})
+        return resp and resp.get('ok', False)
+
+    async def send_media_group_direct(self, items: List[Dict]) -> bool:
+        if not items: return True
+        if len(items) > 10: items = items[:10]
+        logger.info(f"[TG] 📤 Media group (direct): {len(items)} items")
         
         input_media = []
-        for i, item in enumerate(media_items):
-            media_obj = {
-                'type': item['type'],
-                'media': item['media']
-            }
+        for i, item in enumerate(items):
+            obj = {'type': item['type'], 'media': item['media']}
             if i == 0 and item.get('caption'):
-                media_obj['caption'] = fix_broken_html(item['caption'])[:1024]
-                media_obj['parse_mode'] = 'HTML'
-            input_media.append(media_obj)
+                obj['caption'] = fix_broken_html(item['caption'])[:1024]
+                obj['parse_mode'] = 'HTML'
+            input_media.append(obj)
         
-        resp = await self._request('sendMediaGroup', json={
-            'chat_id': self.chat_id,
-            'media': input_media
-        })
-        
-        if resp and isinstance(resp, dict) and resp.get('ok'):
-            results = resp.get('result', [])
-            msg_ids = [res.get('message_id') for res in results if isinstance(res, dict)]
-            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
-            return True
-        
-        logger.error(f"[TG] ❌ Media group failed")
-        return False
-    
-    async def send_media_group_via_download(self, media_items: List[Dict], caption: str = None) -> bool:
-        """Новая схема: скачанные файлы -> загрузка в Telegram -> media group по file_id."""
-        if not media_items:
-            return True
-        
-        if len(media_items) > 10:
-            logger.warning(f"[TG] Media group too large ({len(media_items)}), truncating to 10")
-            media_items = media_items[:10]
-        
-        types = [item['type'] for item in media_items]
-        logger.info(f"[TG] 📤 Sending media group (via download): {len(media_items)} items, types={types}")
+        resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
+        return resp and isinstance(resp, dict) and resp.get('ok', False)
+
+    async def send_media_group_via_download(self, items: List[Dict], caption: str = None) -> bool:
+        if not items: return True
+        if len(items) > 10: items = items[:10]
+        logger.info(f"[TG] 📤 Media group (download): {len(items)} items")
         
         input_media = []
-        for i, item in enumerate(media_items):
-            if item['type'] == 'photo':
-                form = aiohttp.FormData()
-                form.add_field('chat_id', self.chat_id)
-                form.add_field('photo', item['data'], filename=item.get('filename', 'photo.jpg'))
-                upload_resp = await self._request('sendPhoto', data=form)
-                if upload_resp and upload_resp.get('ok'):
-                    file_id = upload_resp['result']['photo'][0]['file_id']
-                else:
-                    logger.error(f"[TG] Failed to upload photo for media group")
-                    return False
-            elif item['type'] == 'video':
-                form = aiohttp.FormData()
-                form.add_field('chat_id', self.chat_id)
-                form.add_field('video', item['data'], filename=item.get('filename', 'video.mp4'))
-                upload_resp = await self._request('sendVideo', data=form)
-                if upload_resp and upload_resp.get('ok'):
-                    file_id = upload_resp['result']['video']['file_id']
-                else:
-                    logger.error(f"[TG] Failed to upload video for media group")
-                    return False
-            else:
-                continue
+        for i, item in enumerate(items):
+            form = aiohttp.FormData()
+            form.add_field('chat_id', self.chat_id)
+            field = 'photo' if item['type'] == 'photo' else 'video'
+            form.add_field(field, item['data'], filename=item.get('filename', f'{field}.jpg'))
+            upload_resp = await self._request(f'send{field.capitalize()}', data=form)
             
-            media_obj = {
-                'type': item['type'],
-                'media': file_id
-            }
+            if not upload_resp or not upload_resp.get('ok'):
+                logger.error(f"[TG] Failed to upload {field}")
+                return False
+            
+            file_id = upload_resp['result'][field][0]['file_id'] if field == 'photo' else upload_resp['result']['video']['file_id']
+            obj = {'type': item['type'], 'media': file_id}
             if i == 0 and caption:
-                media_obj['caption'] = fix_broken_html(caption)[:1024]
-                media_obj['parse_mode'] = 'HTML'
-            input_media.append(media_obj)
-            
-            if upload_resp:
-                msg_id = upload_resp['result']['message_id']
-                await self._request('deleteMessage', json={'chat_id': self.chat_id, 'message_id': msg_id})
+                obj['caption'] = fix_broken_html(caption)[:1024]
+                obj['parse_mode'] = 'HTML'
+            input_media.append(obj)
+            await self._request('deleteMessage', json={'chat_id': self.chat_id, 'message_id': upload_resp['result']['message_id']})
         
-        resp = await self._request('sendMediaGroup', json={
-            'chat_id': self.chat_id,
-            'media': input_media
-        })
-        
-        if resp and isinstance(resp, dict) and resp.get('ok'):
-            results = resp.get('result', [])
-            msg_ids = [res.get('message_id') for res in results if isinstance(res, dict)]
-            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
-            return True
-        
-        logger.error(f"[TG] ❌ Media group failed")
-        return False
-    
-    async def send_media(self, media_type: str, media_data: Union[str, bytes],
-                         caption: str = "", filename: str = "", 
-                         is_url: bool = False, **extra) -> bool:
-        method_map = {
-            'photo': 'sendPhoto', 'video': 'sendVideo',
-            'audio': 'sendAudio', 'voice': 'sendVoice',
-            'document': 'sendDocument'
-        }
+        resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
+        return resp and isinstance(resp, dict) and resp.get('ok', False)
+
+    async def send_media(self, media_type: str, media_data, caption="", filename="", is_url=False, **extra) -> bool:
+        method_map = {'photo': 'sendPhoto', 'video': 'sendVideo', 'audio': 'sendAudio', 'voice': 'sendVoice', 'document': 'sendDocument'}
         method = method_map.get(media_type, 'sendDocument')
         field = media_type if media_type != 'document' else 'document'
         
-        logger.info(f"[TG] 📤 Sending {media_type}: is_url={is_url}")
-        
+        logger.info(f"[TG] 📤 {media_type}: is_url={is_url}")
         form = aiohttp.FormData()
         form.add_field('chat_id', self.chat_id)
         
-        safe_fname = safe_filename(filename) if filename else f"{media_type}.file"
-        
-        if is_url:
-            form.add_field(field, media_data)
-        else:
-            form.add_field(field, media_data, filename=safe_fname)
+        if is_url: form.add_field(field, media_data)
+        else: form.add_field(field, media_data, filename=safe_filename(filename))
         
         if caption and media_type != 'document':
             caption = fix_broken_html(caption)
@@ -732,59 +469,41 @@ class TG:
             form.add_field('parse_mode', 'HTML')
         
         if media_type == 'audio':
-            if extra.get('performer'):
-                form.add_field('performer', extra['performer'][:64])
-            if extra.get('title'):
-                form.add_field('title', extra['title'][:64])
-            if extra.get('duration'):
-                form.add_field('duration', str(extra['duration']))
-        
+            if extra.get('performer'): form.add_field('performer', extra['performer'][:64])
+            if extra.get('title'): form.add_field('title', extra['title'][:64])
+            if extra.get('duration'): form.add_field('duration', str(extra['duration']))
         if media_type == 'voice' and extra.get('duration'):
             form.add_field('duration', str(extra['duration']))
-        
+            
         resp = await self._request(method, data=form)
-        return resp is not None and resp.get('ok', False)
-
+        return resp and resp.get('ok', False)
 
 # ===================================================================
 # 10. MAX CLIENT
 # ===================================================================
 class MX:
     def __init__(self, token: str, cid: str, base: str):
-        self.token = token
-        self.cid = cid
-        self.base = base
+        self.token, self.cid, self.base = token, cid, base
         self.session = None
     
     async def init(self):
-        if not self.session:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
+        if not self.session: self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60))
     
     async def register_webhook(self, webhook_url: str, secret: str = "") -> bool:
         await self.init()
         logger.info(f"[MAX] 🔗 Registering webhook: {webhook_url}")
-        
         body = {"url": webhook_url, "update_types": ["message_created"]}
-        if secret:
-            body["secret"] = secret
-        
-        headers = {'Authorization': self.token, 'Content-Type': 'application/json'}
+        if secret: body["secret"] = secret
         
         try:
-            async with self.session.post(f"{self.base}/subscriptions", headers=headers, json=body) as r:
+            async with self.session.post(f"{self.base}/subscriptions", headers={'Authorization': self.token, 'Content-Type': 'application/json'}, json=body) as r:
                 text = await r.text()
-                logger.info(f"[MAX] Webhook registration response: {r.status}")
-                
-                if r.status == 200:
-                    logger.info(f"[MAX] ✅ Webhook registered successfully")
-                    return True
-                else:
-                    logger.error(f"[MAX] ❌ Webhook registration failed: {text}")
-                    return False
+                logger.info(f"[MAX] Response: {r.status}")
+                if LOG_RAW_MAX: logger.debug(f"[MAX-RESP] {text}")
+                return r.status == 200
         except Exception as e:
-            logger.error(f"[MAX] ❌ Webhook registration exception: {e}")
+            logger.error(f"[MAX] ❌ {e}")
             return False
-
 
 # ===================================================================
 # 11. ОБРАБОТЧИКИ
@@ -793,297 +512,156 @@ tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 media_proc = MediaProcessor()
 
-
 async def process_attachment(att: Dict, caption: str = "") -> bool:
     start_time = time.time()
-    logger.info(f"[ATT] 📎 Processing attachment...")
-    
-    if not isinstance(att, dict):
-        logger.warning("[ATT] ❌ Not a dict, skipping")
-        return False
-    
+    logger.info(f"[ATT] 📎 Processing...")
     tg_type, meta = media_proc.determine(att)
-    
-    logger.info(f"[ATT] Type: {tg_type}, filename: {meta.get('filename')}, size: {meta.get('size')}")
+    logger.info(f"[ATT] Type: {tg_type}, file: {meta.get('filename')}")
     
     direct_url = meta.get('url')
-    if not direct_url:
-        logger.error("[ATT] ❌ No direct URL in payload")
-        return False
-    
-    file_data = None
+    if not direct_url: return False
     
     if tg_type in ('photo', 'video') and direct_url:
-        logger.info(f"[ATT] 📤 Using direct URL for {tg_type}")
-        result = await tg.send_media(
-            media_type=tg_type,
-            media_data=direct_url,
-            caption=caption,
-            filename=safe_filename(meta.get('filename', '')),
-            is_url=True
-        )
-        elapsed = time.time() - start_time
-        logger.info(f"[ATT] {'✅' if result else '❌'} Send result in {elapsed:.2f}s")
-        return result
-    
-    logger.info(f"[ATT] 📥 Downloading {tg_type} from direct URL...")
+        logger.info(f"[ATT] 📤 Using direct URL")
+        res = await tg.send_media(tg_type, direct_url, caption, meta.get('filename', ''), is_url=True)
+        logger.info(f"[ATT] {'✅' if res else '❌'} in {time.time() - start_time:.2f}s")
+        return res
+        
     file_data = await download_from_url(direct_url)
-    
-    if not file_data:
-        logger.error(f"[ATT] ❌ Download failed")
-        return False
+    if not file_data: return False
     
     extra = {}
-    
-    if tg_type == 'audio' and meta.get('size', 0) < 2 * 1024 * 1024 and media_proc.ffmpeg_ok:
-        logger.info(f"[ATT] 🎤 Trying voice conversion...")
+    if tg_type == 'audio' and meta.get('size', 0) < 2*1024*1024 and media_proc.ffmpeg_ok:
         voice_data = convert_to_voice(file_data)
         if voice_data:
-            tg_type = 'voice'
-            file_data = voice_data
+            tg_type, file_data = 'voice', voice_data
             with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
                 tmp.write(voice_data)
-                tmp_path = tmp.name
-            extra['duration'] = get_audio_duration(tmp_path)
-            os.unlink(tmp_path)
-            logger.info(f"[ATT] ✅ Converted to voice, duration={extra['duration']}s")
+                extra['duration'] = get_audio_duration(tmp.name)
+                os.unlink(tmp.name)
     
     if tg_type == 'audio':
-        tags = extract_audio_tags(file_data, meta.get('filename', ''))
-        extra.update(tags)
-        logger.info(f"[ATT] Audio tags: {tags}")
+        extra.update(extract_audio_tags(file_data, meta.get('filename', '')))
     
-    logger.info(f"[ATT] 📤 Sending {tg_type} to Telegram...")
-    
-    result = await tg.send_media(
-        media_type=tg_type,
-        media_data=file_data,
-        caption=caption if tg_type != 'document' else '',
-        filename=safe_filename(meta.get('filename', '')),
-        is_url=False,
-        **extra
-    )
-    
-    elapsed = time.time() - start_time
-    logger.info(f"[ATT] {'✅' if result else '❌'} Send result in {elapsed:.2f}s")
-    return result
-
+    res = await tg.send_media(tg_type, file_data, caption if tg_type != 'document' else '', meta.get('filename', ''), False, **extra)
+    logger.info(f"[ATT] {'✅' if res else '❌'} in {time.time() - start_time:.2f}s")
+    return res
 
 async def handle_max_message(msg: Dict):
-    """Обрабатывает одно сообщение от MAX с гибридной отправкой медиа."""
     start_time = time.time()
     logger.info("=" * 80)
-    logger.info(f"[HANDLE] 🚀 Processing MAX message at {time.strftime('%H:%M:%S')}")
-
-    if LOG_RAW_MAX:
-        logger.debug(f"[HANDLE] Raw message: {json.dumps(msg, ensure_ascii=False)[:2000]}")
+    logger.info(f"[HANDLE] 🚀 Processing...")
+    if LOG_RAW_MAX: logger.debug(f"[HANDLE] Raw: {json.dumps(msg, ensure_ascii=False)[:2000]}")
 
     data = extract_message_data(msg)
-
-    if not data['text'] and not data['attachments']:
-        logger.info("[HANDLE] ⏭ Empty message, skipping")
-        return
+    if not data['text'] and not data['attachments']: return
 
     text = data['text']
     if data['markup']:
-        logger.info(f"[HANDLE] Applying markup ({len(data['markup'])} items)...")
+        logger.info(f"[HANDLE] Applying markup ({len(data['markup'])} items)")
         text = apply_markup(text, data['markup'])
     elif text and ('*' in text or '_' in text or '[' in text):
-        logger.info("[HANDLE] 📝 Using Markdown parser...")
         text = parse_markdown_to_html(text)
 
-    media_items = []
-    other_attachments = []
-
+    media_items, other = [], []
     for att in data['attachments']:
-        tg_type, meta = media_proc.determine(att)
-        if tg_type in ('photo', 'video'):
-            media_items.append({'type': tg_type, 'attachment': att, 'meta': meta})
-        else:
-            other_attachments.append(att)
+        t, _ = media_proc.determine(att)
+        (media_items if t in ('photo', 'video') else other).append({'type': t, 'attachment': att, 'meta': _})
 
-    logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other_attachments)}")
+    logger.info(f"[HANDLE] Media: {len(media_items)}, Other: {len(other)}")
 
-    use_new_scheme = False
+    use_new = False
     if len(media_items) > 1:
-        has_video = any(item['type'] == 'video' for item in media_items)
-        has_photo = any(item['type'] == 'photo' for item in media_items)
-        video_count = sum(1 for item in media_items if item['type'] == 'video')
-        
-        if has_video and (has_photo or video_count >= 2):
-            use_new_scheme = True
-            logger.info(f"[HANDLE] 🔄 Using NEW scheme (download + file_id) for mixed/video group")
-        else:
-            logger.info(f"[HANDLE] 📷 Using OLD scheme (direct URLs) for photo collage")
+        has_v, has_p = any(i['type']=='video' for i in media_items), any(i['type']=='photo' for i in media_items)
+        if has_v and (has_p or sum(1 for i in media_items if i['type']=='video') >= 2):
+            use_new = True
+            logger.info("[HANDLE] 🔄 NEW scheme (mixed/video group)")
 
     if media_items:
         if len(media_items) == 1:
-            # ОДИНОЧНОЕ ФОТО/ВИДЕО — без media group!
-            item = media_items[0]
-            logger.info(f"[HANDLE] 📷 Single media, sending via send_media...")
-            caption = text
-            await process_attachment(item['attachment'], caption)
-        elif use_new_scheme:
-            downloaded_media = []
+            logger.info("[HANDLE] 📷 Single media, sending directly")
+            await process_attachment(media_items[0]['attachment'], text)
+        elif use_new:
+            downloaded = []
             for item in media_items:
-                att = item['attachment']
-                meta = item['meta']
-                direct_url = meta.get('url')
-                if not direct_url:
-                    logger.warning(f"[HANDLE] No URL for {item['type']}, skipping")
-                    continue
-
-                logger.info(f"[HANDLE] 📥 Downloading {item['type']} for reliable group...")
-                file_data = await download_from_url(direct_url)
-                if file_data:
-                    downloaded_media.append({
-                        'type': item['type'],
-                        'data': file_data,
-                        'filename': safe_filename(meta.get('filename', ''))
-                    })
-                else:
-                    logger.error(f"[HANDLE] Failed to download {item['type']}")
-
-            if downloaded_media:
-                ok = await tg.send_media_group_via_download(downloaded_media, text)
-                if ok:
-                    logger.info(f"[HANDLE] ✅ Media group sent successfully (new scheme)")
-                else:
-                    logger.warning(f"[HANDLE] Media group failed, sending individually...")
-                    for i, item in enumerate(downloaded_media):
-                        caption = text if i == 0 else ""
-                        await tg.send_media(item['type'], item['data'], caption=caption, filename=item['filename'])
+                url = item['meta'].get('url')
+                if not url: continue
+                data = await download_from_url(url)
+                if data: downloaded.append({'type': item['type'], 'data': data, 'filename': safe_filename(item['meta'].get('filename', ''))})
+            if downloaded:
+                ok = await tg.send_media_group_via_download(downloaded, text)
+                if not ok:
+                    for i, item in enumerate(downloaded):
+                        await tg.send_media(item['type'], item['data'], caption=text if i==0 else "", filename=item['filename'])
                         await asyncio.sleep(0.3)
         else:
-            group_items = [
-                {
-                    'type': item['type'],
-                    'media': item['meta'].get('url'),
-                    'caption': text if i == 0 else None
-                }
-                for i, item in enumerate(media_items)
-                if item['meta'].get('url')
-            ]
-            
-            if group_items:
-                logger.info(f"[HANDLE] 📸 Sending media group with {len(group_items)} items (old scheme)...")
-                ok = await tg.send_media_group_direct(group_items)
-                if ok:
-                    logger.info(f"[HANDLE] ✅ Media group sent successfully (old scheme)")
-                else:
-                    logger.warning(f"[HANDLE] Media group failed, sending individually...")
+            items = [{'type': i['type'], 'media': i['meta'].get('url'), 'caption': text if idx==0 else None} for idx, i in enumerate(media_items) if i['meta'].get('url')]
+            if items:
+                ok = await tg.send_media_group_direct(items)
+                if not ok:
                     for i, item in enumerate(media_items):
-                        caption = text if i == 0 else ""
-                        await process_attachment(item['attachment'], caption)
+                        await process_attachment(item['attachment'], text if i==0 else "")
                         await asyncio.sleep(0.3)
-    else:
-        if text and text.strip():
-            await tg.send_text(text)
-            await asyncio.sleep(0.3)
+    elif text:
+        await tg.send_text(text)
+        await asyncio.sleep(0.3)
 
-    for i, att in enumerate(other_attachments):
-        logger.info(f"[HANDLE] Processing other attachment {i+1}/{len(other_attachments)}")
+    for att in other:
         await process_attachment(att, "")
         await asyncio.sleep(0.5)
 
-    elapsed = time.time() - start_time
-    logger.info(f"[HANDLE] ✅ Message processing complete in {elapsed:.2f}s")
+    logger.info(f"[HANDLE] ✅ Complete in {time.time() - start_time:.2f}s")
     logger.info("=" * 80)
 
-
 # ===================================================================
-# 12. WEBHOOK HANDLER
+# 12. WEBHOOK HANDLER (МАКСИМАЛЬНОЕ ЛОГИРОВАНИЕ)
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
-    logger.info("[WEBHOOK] 📨 Incoming request")
-    
+    logger.info(f"[WEBHOOK] 📨 {request.method} from {request.remote}")
     if request.method != 'POST':
-        logger.warning(f"[WEBHOOK] Invalid method: {request.method}")
-        return web.Response(status=405, text="Method Not Allowed")
+        return web.Response(status=405)
     
     if VERIFY_WEBHOOK_SECRET and MAX_WEBHOOK_SECRET:
-        secret = request.headers.get('X-Max-Bot-Api-Secret')
-        if secret != MAX_WEBHOOK_SECRET:
-            logger.warning(f"[WEBHOOK] ❌ Invalid secret")
-            return web.Response(status=403, text="Forbidden")
-        logger.info("[WEBHOOK] ✅ Secret verified")
+        if request.headers.get('X-Max-Bot-Api-Secret') != MAX_WEBHOOK_SECRET:
+            logger.warning("[WEBHOOK] ❌ Invalid secret")
+            return web.Response(status=403)
     
     try:
         body = await request.json()
-        logger.info(f"[WEBHOOK] 🔑 Keys: {list(body.keys())}")
+        logger.info(f"[WEBHOOK] Keys: {list(body.keys())}, Type: {body.get('update_type')}")
+        logger.info(f"[WEBHOOK] FULL BODY:\n{json.dumps(body, ensure_ascii=False, indent=2)}")
         
-        if LOG_RAW_MAX:
-            logger.debug(f"[WEBHOOK] Full body: {json.dumps(body, ensure_ascii=False)[:3000]}")
-        
-        update_type = body.get('update_type', 'unknown')
-        logger.info(f"[WEBHOOK] Update type: {update_type}")
-        
-        if update_type == 'message_created':
-            msg = body.get('message', {})
-            if msg:
-                asyncio.create_task(handle_max_message(msg))
-                logger.info("[WEBHOOK] ✅ Queued for processing")
-            else:
-                logger.warning("[WEBHOOK] No message in update")
-        
-        return web.Response(status=200, text="OK")
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"[WEBHOOK] ❌ Invalid JSON: {e}")
-        return web.Response(status=400, text="Bad Request")
+        if body.get('update_type') == 'message_created' and (msg := body.get('message')):
+            asyncio.create_task(handle_max_message(msg))
+            logger.info("[WEBHOOK] ✅ Queued")
+        return web.Response(status=200)
     except Exception as e:
-        logger.error(f"[WEBHOOK] ❌ Exception: {e}", exc_info=True)
-        return web.Response(status=500, text="Internal Server Error")
+        logger.error(f"[WEBHOOK] ❌ {e}", exc_info=True)
+        return web.Response(status=500)
     finally:
         logger.info("=" * 60)
 
-
 async def health_handler(request):
-    return web.json_response({
-        'ok': True,
-        'service': 'MAX → Telegram Forwarder',
-        'version': 'final-lifo'
-    })
-
+    return web.json_response({'ok': True, 'version': 'final-full-log'})
 
 # ===================================================================
 # 13. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL LIFO VERSION]...")
-    
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL FULL-LOG]...")
     if RENDER_EXTERNAL_URL:
-        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        await mx.register_webhook(webhook_url, MAX_WEBHOOK_SECRET)
-    else:
-        logger.warning("⚠️ RENDER_EXTERNAL_URL not set, skipping webhook registration")
+        await mx.register_webhook(f"{RENDER_EXTERNAL_URL}/webhook", MAX_WEBHOOK_SECRET)
     
     app = web.Application()
     app.router.add_post('/webhook', webhook_handler)
-    app.router.add_get('/webhook', webhook_handler)
     app.router.add_get('/health', health_handler)
     
     runner = web.AppRunner(app)
     await runner.setup()
-    
-    port = int(os.getenv('PORT', 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    logger.info(f"🌐 Server running on port {port}")
-    logger.info(f"📡 Webhook endpoint: /webhook")
-    logger.info(f"💓 Health check: /health")
-    logger.info("✅ Ready to receive messages from MAX!")
-    
+    await web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 8080))).start()
+    logger.info(f"🌐 Ready on port {os.getenv('PORT', 8080)}")
     await asyncio.Event().wait()
 
-
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("🛑 Stopped by user")
-    except Exception as e:
-        logger.exception(f"💥 FATAL ERROR: {e}")
-        sys.exit(1)
+    asyncio.run(main())
