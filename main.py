@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С КНОПКАМИ
-- Возвращена поддержка кнопок-ссылок (reply_markup)
-- Исправлена media group (без дублей)
+ФИНАЛЬНАЯ ВЕРСИЯ СО ВСЕМИ ИСПРАВЛЕНИЯМИ
+- Расширенная диагностика webhook (логирование всех событий)
+- Надёжная отправка коллажей через скачивание (фото/видео)
+- Кнопки-ссылки (если MAX их отдаёт)
 - Исправлен LIFO для комбинаций форматирований
-- Аудио конвертируется в голосовое только если type='voice'
 - Коррекция offset через UTF-16
-- Полное логирование
+- Аудио конвертируется в голосовое только если type='voice'
 - Транслитерация имён файлов
 """
 import os
@@ -66,7 +66,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH BUTTONS]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL ALL FIXES]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -129,16 +129,11 @@ def safe_filename(filename: str) -> str:
 # 4. КОНВЕРТАЦИЯ КНОПОК MAX → TELEGRAM
 # ===================================================================
 def convert_max_buttons(reply_markup: Dict) -> Optional[Dict]:
-    """
-    Конвертирует кнопки MAX в формат Telegram InlineKeyboardMarkup.
-    """
     if not reply_markup:
         return None
     
     keyboard = reply_markup.get('inline_keyboard') or reply_markup.get('keyboard')
-    
     if not keyboard or not isinstance(keyboard, list):
-        logger.warning(f"[BUTTONS] Unknown keyboard format: {reply_markup}")
         return None
     
     telegram_keyboard = []
@@ -146,22 +141,15 @@ def convert_max_buttons(reply_markup: Dict) -> Optional[Dict]:
         telegram_row = []
         for button in row:
             if button.get('type') == 'url' or button.get('url'):
-                telegram_row.append({
-                    'text': button.get('text', 'Button'),
-                    'url': button.get('url', '')
-                })
+                telegram_row.append({'text': button.get('text', 'Button'), 'url': button.get('url', '')})
             elif button.get('type') == 'callback':
-                telegram_row.append({
-                    'text': button.get('text', 'Button'),
-                    'callback_data': button.get('payload', '{}')
-                })
+                telegram_row.append({'text': button.get('text', 'Button'), 'callback_data': button.get('payload', '{}')})
         if telegram_row:
             telegram_keyboard.append(telegram_row)
     
     if telegram_keyboard:
-        logger.info(f"[BUTTONS] ✅ Converted {len(telegram_keyboard)} rows of buttons")
+        logger.info(f"[BUTTONS] ✅ Converted {len(telegram_keyboard)} rows")
         return {'inline_keyboard': telegram_keyboard}
-    
     return None
 
 # ===================================================================
@@ -341,16 +329,26 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     return final_text
 
 # ===================================================================
-# 8. ИЗВЛЕЧЕНИЕ ДАННЫХ
+# 8. ИЗВЛЕЧЕНИЕ ДАННЫХ (РАСШИРЕННЫЙ ПОИСК КНОПОК)
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
     logger.info("[EXTRACT] ========== START EXTRACTION ==========")
+    logger.info(f"[EXTRACT] 🔑 Top-level keys: {list(msg.keys())}")
     
     link = msg.get('link', {})
+    if link:
+        logger.info(f"[EXTRACT] 🔑 link keys: {list(link.keys())}")
+        if 'message' in link:
+            logger.info(f"[EXTRACT] 🔑 link.message keys: {list(link['message'].keys())}")
+            if 'reply_markup' in link['message']:
+                logger.info(f"[EXTRACT] 🎛️ Found reply_markup in link.message!")
+    
     is_forward = isinstance(link, dict) and link.get('type') == 'forward' and 'message' in link
     if is_forward:
         logger.info("[EXTRACT] 📨 This is a FORWARDED message")
-    inner = link['message'] if is_forward else msg
+        inner = link['message']
+    else:
+        inner = msg
     
     body = inner.get('body', {})
     text = body.get('text', '') or inner.get('text', '')
@@ -359,8 +357,22 @@ def extract_message_data(msg: Dict) -> Dict:
     att_list = body.get('attachments') or inner.get('attachments') or []
     attachments = [a for a in att_list if isinstance(a, dict)]
     
-    # Извлекаем кнопки
-    reply_markup = inner.get('reply_markup') or msg.get('reply_markup')
+    # РАСШИРЕННЫЙ ПОИСК КНОПОК
+    reply_markup = None
+    if inner.get('reply_markup'):
+        reply_markup = inner.get('reply_markup')
+        logger.info(f"[EXTRACT] 🎛️ Found reply_markup in inner")
+    elif msg.get('reply_markup'):
+        reply_markup = msg.get('reply_markup')
+        logger.info(f"[EXTRACT] 🎛️ Found reply_markup in msg root")
+    elif body.get('reply_markup'):
+        reply_markup = body.get('reply_markup')
+        logger.info(f"[EXTRACT] 🎛️ Found reply_markup in body")
+    elif inner.get('inline_keyboard'):
+        reply_markup = {'inline_keyboard': inner.get('inline_keyboard')}
+        logger.info(f"[EXTRACT] 🎛️ Found inline_keyboard in inner")
+    else:
+        logger.info(f"[EXTRACT] 🔍 All inner keys: {list(inner.keys())}")
     
     result = {
         "mid": body.get('mid') or inner.get('mid', ''),
@@ -374,8 +386,9 @@ def extract_message_data(msg: Dict) -> Dict:
     logger.info(f"[EXTRACT] mid: {result['mid'][:30]}...")
     logger.info(f"[EXTRACT] text_len: {len(text)}, markup: {len(markup)}, attachments: {len(attachments)}")
     if reply_markup:
-        logger.info(f"[EXTRACT] 🎛️ Found reply_markup: {json.dumps(reply_markup, ensure_ascii=False)[:300]}")
-    logger.info("[EXTRACT] ========== END EXTRACTION ==========")
+        logger.info(f"[EXTRACT] 🎛️ Final reply_markup: {json.dumps(reply_markup, ensure_ascii=False)[:300]}")
+    else:
+        logger.info("[EXTRACT] ❌ No reply_markup found")
     
     return result
 
@@ -537,7 +550,14 @@ class TG:
                 
                 resp = json.loads(txt)
                 if r.status == 200 and resp.get('ok'):
-                    logger.info(f"[TG] ✅ Success: msg_id={resp.get('result', {}).get('message_id')}")
+                    result = resp.get('result')
+                    if isinstance(result, dict):
+                        msg_id = result.get('message_id')
+                    elif isinstance(result, list) and result:
+                        msg_id = [r.get('message_id') for r in result if isinstance(r, dict)]
+                    else:
+                        msg_id = 'unknown'
+                    logger.info(f"[TG] ✅ Success: msg_id={msg_id}")
                     return resp
                 elif r.status == 429:
                     wait = resp.get('parameters', {}).get('retry_after', 10)
@@ -562,27 +582,35 @@ class TG:
         resp = await self._request('sendMessage', json=payload)
         return resp and resp.get('ok', False)
 
-    async def send_media_group_direct(self, items: List[Dict], caption: str = None) -> bool:
+    async def send_media_group_via_download(self, items: List[Dict], caption: str = None) -> bool:
         if not items: return True
         if len(items) > 10: items = items[:10]
-        logger.info(f"[TG] 📤 Media group: {len(items)} items")
+        logger.info(f"[TG] 📤 Media group (via download): {len(items)} items")
         
         input_media = []
         for i, item in enumerate(items):
-            obj = {'type': item['type'], 'media': item['media']}
+            form = aiohttp.FormData()
+            form.add_field('chat_id', self.chat_id)
+            field = 'photo' if item['type'] == 'photo' else 'video'
+            form.add_field(field, item['data'], filename=item.get('filename', f'{field}.jpg'))
+            upload_resp = await self._request(f'send{field.capitalize()}', data=form)
+            
+            if not upload_resp or not upload_resp.get('ok'):
+                logger.error(f"[TG] Failed to upload {field}")
+                return False
+            
+            file_id = upload_resp['result'][field][0]['file_id'] if field == 'photo' else upload_resp['result']['video']['file_id']
+            obj = {'type': item['type'], 'media': file_id}
             if i == 0 and caption:
                 obj['caption'] = fix_broken_html(caption)[:1024]
                 obj['parse_mode'] = 'HTML'
             input_media.append(obj)
+            
+            msg_id = upload_resp['result']['message_id']
+            await self._request('deleteMessage', json={'chat_id': self.chat_id, 'message_id': msg_id})
         
         resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
-        
-        if resp and resp.get('ok'):
-            logger.info(f"[TG] ✅ Media group sent successfully")
-            return True
-        
-        logger.error(f"[TG] ❌ Media group failed")
-        return False
+        return resp and resp.get('ok', False)
 
     async def send_media(self, media_type: str, media_data, caption="", filename="", is_url=False, **extra) -> bool:
         method_map = {'photo': 'sendPhoto', 'video': 'sendVideo', 'audio': 'sendAudio', 'voice': 'sendVoice', 'document': 'sendDocument'}
@@ -747,7 +775,6 @@ async def handle_max_message(msg: Dict):
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
-    # Конвертируем кнопки, если они есть
     reply_markup = None
     if data.get('reply_markup'):
         reply_markup = convert_max_buttons(data['reply_markup'])
@@ -759,23 +786,40 @@ async def handle_max_message(msg: Dict):
             logger.info("[HANDLE] 📷 Single media, sending directly")
             await process_attachment(media_items[0]['attachment'], text)
         else:
-            logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items")
-            items = []
+            logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items - using reliable download scheme")
+            
+            downloaded = []
             for item in media_items:
                 url = item['meta'].get('url')
-                if url:
-                    items.append({'type': item['type'], 'media': url})
+                if not url:
+                    logger.warning(f"[HANDLE] No URL for {item['type']}, skipping")
+                    continue
+                
+                logger.info(f"[HANDLE] 📥 Downloading {item['type']} for media group...")
+                data = await download_from_url(url)
+                if data:
+                    downloaded.append({
+                        'type': item['type'],
+                        'data': data,
+                        'filename': safe_filename(item['meta'].get('filename', ''))
+                    })
+                else:
+                    logger.error(f"[HANDLE] Failed to download {item['type']}")
             
-            if items:
-                ok = await tg.send_media_group_direct(items, text)
+            if downloaded:
+                ok = await tg.send_media_group_via_download(downloaded, text)
                 if ok:
                     logger.info("[HANDLE] ✅ Media group sent successfully")
                 else:
                     logger.warning("[HANDLE] Media group failed, sending individually")
-                    for i, item in enumerate(media_items):
+                    for i, item in enumerate(downloaded):
                         caption = text if i == 0 else ""
-                        await process_attachment(item['attachment'], caption)
+                        await tg.send_media(item['type'], item['data'], caption=caption, filename=item['filename'])
                         await asyncio.sleep(0.3)
+            else:
+                logger.warning("[HANDLE] No media downloaded, sending text only")
+                if text:
+                    await tg.send_text(text, reply_markup=reply_markup)
     elif text:
         await tg.send_text(text, reply_markup=reply_markup)
         await asyncio.sleep(0.3)
@@ -789,7 +833,7 @@ async def handle_max_message(msg: Dict):
     logger.info("=" * 80)
 
 # ===================================================================
-# 15. WEBHOOK HANDLER
+# 15. WEBHOOK HANDLER (РАСШИРЕННАЯ ДИАГНОСТИКА)
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
@@ -809,15 +853,21 @@ async def webhook_handler(request):
     
     try:
         body = await request.json()
-        logger.info(f"[WEBHOOK] Keys: {list(body.keys())}")
-        logger.info(f"[WEBHOOK] Update type: {body.get('update_type')}")
+        update_type = body.get('update_type', 'unknown')
+        logger.info(f"[WEBHOOK] 🔔 Update type: {update_type}")
         logger.info(f"[WEBHOOK] FULL BODY:\n{json.dumps(body, ensure_ascii=False, indent=2)}")
         
-        if body.get('update_type') == 'message_created' and (msg := body.get('message')):
-            logger.info(f"[WEBHOOK] ✅ Message received, queuing for processing...")
+        if update_type == 'message_created':
+            msg = body.get('message', {})
+            logger.info(f"[WEBHOOK] 📝 Message created: {msg.get('body', {}).get('text', '')[:50]}")
             asyncio.create_task(handle_max_message(msg))
+        elif update_type == 'message_edited':
+            msg = body.get('message', {})
+            logger.info(f"[WEBHOOK] ✏️ Message edited: {msg.get('body', {}).get('text', '')[:50]}")
+        elif update_type == 'message_deleted':
+            logger.info(f"[WEBHOOK] 🗑️ Message deleted")
         else:
-            logger.info(f"[WEBHOOK] ⏭ Skipping (not message_created)")
+            logger.info(f"[WEBHOOK] ⏭ Unhandled update type: {update_type}")
         
         return web.Response(status=200)
     except json.JSONDecodeError as e:
@@ -830,13 +880,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-with-buttons'})
+    return web.json_response({'ok': True, 'version': 'final-all-fixes'})
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL WITH BUTTONS]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL ALL FIXES]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
