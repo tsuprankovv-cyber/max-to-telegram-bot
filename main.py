@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕННОЙ MEDIA GROUP
-- Исправлена обработка ответа sendMediaGroup (убраны дубли)
+ФИНАЛЬНАЯ ВЕРСИЯ С КНОПКАМИ
+- Возвращена поддержка кнопок-ссылок (reply_markup)
+- Исправлена media group (без дублей)
 - Исправлен LIFO для комбинаций форматирований
-- Возвращена media group для коллажей
 - Аудио конвертируется в голосовое только если type='voice'
 - Коррекция offset через UTF-16
 - Полное логирование
@@ -66,7 +66,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - FIXED MEDIA GROUP]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH BUTTONS]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -126,7 +126,46 @@ def safe_filename(filename: str) -> str:
     return f"{safe_name}.{ext}" if ext else safe_name
 
 # ===================================================================
-# 4. УНИВЕРСАЛЬНАЯ КОРРЕКЦИЯ OFFSET ЧЕРЕЗ UTF-16
+# 4. КОНВЕРТАЦИЯ КНОПОК MAX → TELEGRAM
+# ===================================================================
+def convert_max_buttons(reply_markup: Dict) -> Optional[Dict]:
+    """
+    Конвертирует кнопки MAX в формат Telegram InlineKeyboardMarkup.
+    """
+    if not reply_markup:
+        return None
+    
+    keyboard = reply_markup.get('inline_keyboard') or reply_markup.get('keyboard')
+    
+    if not keyboard or not isinstance(keyboard, list):
+        logger.warning(f"[BUTTONS] Unknown keyboard format: {reply_markup}")
+        return None
+    
+    telegram_keyboard = []
+    for row in keyboard:
+        telegram_row = []
+        for button in row:
+            if button.get('type') == 'url' or button.get('url'):
+                telegram_row.append({
+                    'text': button.get('text', 'Button'),
+                    'url': button.get('url', '')
+                })
+            elif button.get('type') == 'callback':
+                telegram_row.append({
+                    'text': button.get('text', 'Button'),
+                    'callback_data': button.get('payload', '{}')
+                })
+        if telegram_row:
+            telegram_keyboard.append(telegram_row)
+    
+    if telegram_keyboard:
+        logger.info(f"[BUTTONS] ✅ Converted {len(telegram_keyboard)} rows of buttons")
+        return {'inline_keyboard': telegram_keyboard}
+    
+    return None
+
+# ===================================================================
+# 5. УНИВЕРСАЛЬНАЯ КОРРЕКЦИЯ OFFSET ЧЕРЕЗ UTF-16
 # ===================================================================
 def get_utf16_length(text: str) -> int:
     return len(text.encode('utf-16-le')) // 2
@@ -165,7 +204,7 @@ def normalize_max_offset(text: str, max_offset: int, max_length: int = None) -> 
     return python_offset, max_length
 
 # ===================================================================
-# 5. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ
+# 6. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ
 # ===================================================================
 def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     if not markup:
@@ -196,7 +235,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     return filtered
 
 # ===================================================================
-# 6. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕННЫЙ LIFO)
+# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕННЫЙ LIFO)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -277,7 +316,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     for i, char in enumerate(text):
         if i in tag_ends:
-            # ИСПРАВЛЕНИЕ: закрываем в ОБРАТНОМ порядке (LIFO)
             for open_tag in reversed(open_tags):
                 if open_tag in tag_ends[i]:
                     open_tags.remove(open_tag)
@@ -303,7 +341,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     return final_text
 
 # ===================================================================
-# 7. ИЗВЛЕЧЕНИЕ ДАННЫХ
+# 8. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
     logger.info("[EXTRACT] ========== START EXTRACTION ==========")
@@ -321,22 +359,28 @@ def extract_message_data(msg: Dict) -> Dict:
     att_list = body.get('attachments') or inner.get('attachments') or []
     attachments = [a for a in att_list if isinstance(a, dict)]
     
+    # Извлекаем кнопки
+    reply_markup = inner.get('reply_markup') or msg.get('reply_markup')
+    
     result = {
         "mid": body.get('mid') or inner.get('mid', ''),
         "text": text,
         "markup": markup,
         "attachments": attachments,
-        "is_forward": is_forward
+        "is_forward": is_forward,
+        "reply_markup": reply_markup
     }
     
     logger.info(f"[EXTRACT] mid: {result['mid'][:30]}...")
     logger.info(f"[EXTRACT] text_len: {len(text)}, markup: {len(markup)}, attachments: {len(attachments)}")
+    if reply_markup:
+        logger.info(f"[EXTRACT] 🎛️ Found reply_markup: {json.dumps(reply_markup, ensure_ascii=False)[:300]}")
     logger.info("[EXTRACT] ========== END EXTRACTION ==========")
     
     return result
 
 # ===================================================================
-# 8. АУДИО УТИЛИТЫ
+# 9. АУДИО УТИЛИТЫ
 # ===================================================================
 def get_audio_duration(file_path: str) -> int:
     try:
@@ -404,7 +448,7 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     return ogg_data
 
 # ===================================================================
-# 9. СКАЧИВАНИЕ ПО URL
+# 10. СКАЧИВАНИЕ ПО URL
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
     if not url: return None
@@ -425,7 +469,7 @@ async def download_from_url(url: str) -> Optional[bytes]:
         return None
 
 # ===================================================================
-# 10. MEDIA PROCESSOR
+# 11. MEDIA PROCESSOR
 # ===================================================================
 class MediaProcessor:
     PHOTO_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'tiff'}
@@ -464,7 +508,7 @@ class MediaProcessor:
         return 'document', meta
 
 # ===================================================================
-# 11. TELEGRAM CLIENT
+# 12. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -507,11 +551,15 @@ class TG:
             logger.error(f"[TG] ❌ Exception: {e}")
             return None
 
-    async def send_text(self, text: str) -> bool:
+    async def send_text(self, text: str, reply_markup: Optional[Dict] = None) -> bool:
         if not text: return True
         text = fix_broken_html(text)
         logger.info(f"[TG] 📤 Sending text: {text[:100]}...")
-        resp = await self._request('sendMessage', json={'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML'})
+        payload = {'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
+        if reply_markup:
+            payload['reply_markup'] = reply_markup
+            logger.info(f"[TG] 🎛️ Sending with reply_markup")
+        resp = await self._request('sendMessage', json=payload)
         return resp and resp.get('ok', False)
 
     async def send_media_group_direct(self, items: List[Dict], caption: str = None) -> bool:
@@ -529,7 +577,6 @@ class TG:
         
         resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
         
-        # ПРОСТАЯ ПРОВЕРКА БЕЗ ОШИБОК
         if resp and resp.get('ok'):
             logger.info(f"[TG] ✅ Media group sent successfully")
             return True
@@ -574,7 +621,7 @@ class TG:
         return resp and resp.get('ok', False)
 
 # ===================================================================
-# 12. MAX CLIENT
+# 13. MAX CLIENT
 # ===================================================================
 class MX:
     def __init__(self, token: str, cid: str, base: str):
@@ -606,7 +653,7 @@ class MX:
             return False
 
 # ===================================================================
-# 13. ОБРАБОТЧИКИ
+# 14. ОБРАБОТЧИКИ
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -647,7 +694,6 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         return False
     
     extra = {}
-    # Конвертируем в голосовое ТОЛЬКО если type='voice'
     if meta.get('original_type') == 'voice' and media_proc.ffmpeg_ok:
         logger.info(f"[ATT] 🎤 Converting voice...")
         voice_data = convert_to_voice(file_data)
@@ -701,6 +747,13 @@ async def handle_max_message(msg: Dict):
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
+    # Конвертируем кнопки, если они есть
+    reply_markup = None
+    if data.get('reply_markup'):
+        reply_markup = convert_max_buttons(data['reply_markup'])
+        if reply_markup:
+            logger.info(f"[HANDLE] 🎛️ Buttons converted for Telegram")
+
     if media_items:
         if len(media_items) == 1:
             logger.info("[HANDLE] 📷 Single media, sending directly")
@@ -724,7 +777,7 @@ async def handle_max_message(msg: Dict):
                         await process_attachment(item['attachment'], caption)
                         await asyncio.sleep(0.3)
     elif text:
-        await tg.send_text(text)
+        await tg.send_text(text, reply_markup=reply_markup)
         await asyncio.sleep(0.3)
 
     for att in other:
@@ -736,7 +789,7 @@ async def handle_max_message(msg: Dict):
     logger.info("=" * 80)
 
 # ===================================================================
-# 14. WEBHOOK HANDLER
+# 15. WEBHOOK HANDLER
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
@@ -777,13 +830,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-media-group-fixed'})
+    return web.json_response({'ok': True, 'version': 'final-with-buttons'})
 
 # ===================================================================
-# 15. ЗАПУСК
+# 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL MEDIA GROUP FIXED]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL WITH BUTTONS]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
