@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С УНИВЕРСАЛЬНОЙ КОРРЕКЦИЕЙ OFFSET
-- Коррекция offset через UTF-16 (универсальное решение)
-- Фильтрация вложенных сущностей одного типа
-- Сортировка по убыванию длины (внешние теги раньше)
+ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЯМИ
+- Правильное извлечение URL из payload
+- Отключена проблемная media group (отправка по одному)
+- Универсальная коррекция offset через UTF-16
+- Фильтрация вложенных сущностей
 - Полное логирование
-- Гибридная отправка медиа
 - Транслитерация имён файлов
 """
 import os
@@ -65,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - UTF16 UNIVERSAL OFFSET]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL FIXED VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -128,18 +128,12 @@ def safe_filename(filename: str) -> str:
 # 4. УНИВЕРСАЛЬНАЯ КОРРЕКЦИЯ OFFSET ЧЕРЕЗ UTF-16
 # ===================================================================
 def get_utf16_length(text: str) -> int:
-    """Возвращает длину текста в UTF-16 кодовых единицах."""
     return len(text.encode('utf-16-le')) // 2
 
 def normalize_max_offset(text: str, max_offset: int, max_length: int = None) -> Tuple[int, int]:
-    """
-    Корректирует offset от MAX (UTF-16) в offset Python (code points).
-    Возвращает (python_offset, python_length).
-    """
     python_offset = 0
     utf16_pos = 0
     
-    # Находим Python offset
     for i, char in enumerate(text):
         if utf16_pos >= max_offset:
             python_offset = i
@@ -170,10 +164,9 @@ def normalize_max_offset(text: str, max_offset: int, max_length: int = None) -> 
     return python_offset, max_length
 
 # ===================================================================
-# 5. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ ОДНОГО ТИПА
+# 5. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ
 # ===================================================================
 def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
-    """Удаляет вложенные сущности одного типа."""
     if not markup:
         return markup
     
@@ -186,10 +179,8 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
         
         is_nested = False
         for j, other in enumerate(markup):
-            if i == j:
-                continue
-            if other.get('type') != etype:
-                continue
+            if i == j: continue
+            if other.get('type') != etype: continue
             other_offset = other.get('from', 0)
             other_end = other_offset + other.get('length', 0)
             
@@ -204,7 +195,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     return filtered
 
 # ===================================================================
-# 6. КОНВЕРТАЦИЯ РАЗМЕТКИ (С УНИВЕРСАЛЬНОЙ КОРРЕКЦИЕЙ)
+# 6. КОНВЕРТАЦИЯ РАЗМЕТКИ
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -230,41 +221,29 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text:
         return text
     
-    # Фильтруем вложенные сущности одного типа
     markup = filter_overlapping_same_type(markup)
     
     logger.info(f"[MARKUP] ========== START CONVERSION ==========")
     logger.info(f"[MARKUP] Text length (Python): {len(text)}")
-    logger.info(f"[MARKUP] Text length (UTF-16): {get_utf16_length(text)}")
-    logger.info(f"[MARKUP] Text preview: {text[:100]}...")
-    logger.info(f"[MARKUP] Entities count (filtered): {len(markup)}")
-    
-    if LOG_MARKUP:
-        logger.debug(f"[MARKUP] Raw markup: {json.dumps(markup, ensure_ascii=False, indent=2)}")
+    logger.info(f"[MARKUP] Entities count: {len(markup)}")
     
     start_time = time.time()
     
-    # 1. Корректируем offset через UTF-16
     corrected_markup = []
     for entity in markup:
         entity = entity.copy()
         max_offset = entity.get('from', 0)
         max_length = entity.get('length', 0)
-        
         python_offset, python_length = normalize_max_offset(text, max_offset, max_length)
         entity['from'] = python_offset
         entity['length'] = python_length
-        
         corrected_markup.append(entity)
     
-    # 2. Сортируем: сначала по offset, потом по убыванию длины
     sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), -m.get('length', 0)))
     
-    # 3. Присваиваем order
     for idx, entity in enumerate(sorted_markup):
         entity['_open_order'] = idx
     
-    # 4. Строим карту тегов
     tag_starts = {}
     tag_ends = {}
     
@@ -274,9 +253,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         etype = entity.get('type', '')
         open_order = entity.get('_open_order', 0)
         
-        if etype not in MAX_TAG_MAP:
-            logger.warning(f"[MARKUP] Unknown type: '{etype}', skipping")
-            continue
+        if etype not in MAX_TAG_MAP: continue
         
         tag_name = MAX_TAG_MAP[etype]
         
@@ -288,62 +265,41 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         
         close_tag = f'</{tag_name}>'
         
-        if offset not in tag_starts:
-            tag_starts[offset] = []
+        if offset not in tag_starts: tag_starts[offset] = []
         tag_starts[offset].append((open_tag, open_order))
         
         end_pos = offset + length
-        if end_pos not in tag_ends:
-            tag_ends[end_pos] = []
+        if end_pos not in tag_ends: tag_ends[end_pos] = []
         tag_ends[end_pos].append((close_tag, open_order))
         
         logger.info(f"[MARKUP] Entity {open_order}: {etype} -> <{tag_name}> [{offset}:{end_pos}]")
     
-    logger.info(f"[MARKUP] Tag starts at positions: {sorted(tag_starts.keys())}")
-    logger.info(f"[MARKUP] Tag ends at positions: {sorted(tag_ends.keys())}")
-    
-    # 5. Проходим по тексту
     result = []
     open_tags = []
     
     for i, char in enumerate(text):
-        if i % 50 == 0 and (i in tag_starts or i in tag_ends):
-            logger.debug(f"[MARKUP] Position {i}: char='{char}'")
-        
-        # Закрываем теги
         if i in tag_ends:
             closing = sorted(tag_ends[i], key=lambda x: -x[1])
-            logger.debug(f"[MARKUP] Position {i}: closing {len(closing)} tags (order: {[c[1] for c in closing]})")
             for close_tag, open_order in closing:
                 for j in range(len(open_tags) - 1, -1, -1):
                     if open_tags[j][1] == open_order:
                         result.append(close_tag)
                         open_tags.pop(j)
-                        logger.debug(f"[MARKUP]   Closed {close_tag} (order={open_order})")
                         break
         
-        # Открываем теги
         if i in tag_starts:
             opening = sorted(tag_starts[i], key=lambda x: x[1])
-            logger.debug(f"[MARKUP] Position {i}: opening {len(opening)} tags (order: {[o[1] for o in opening]})")
             for open_tag, open_order in opening:
                 open_tags.append((open_tag, open_order))
                 result.append(open_tag)
-                logger.debug(f"[MARKUP]   Opened {open_tag} (order={open_order})")
         
         result.append(char)
     
-    # Закрываем оставшиеся
-    if open_tags:
-        logger.info(f"[MARKUP] Closing {len(open_tags)} remaining tags")
-        for close_tag, open_order in reversed(open_tags):
-            result.append(close_tag)
+    for close_tag, _ in reversed(open_tags):
+        result.append(close_tag)
     
     final_text = ''.join(result)
-    elapsed = time.time() - start_time
-    
-    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s")
-    logger.info(f"[MARKUP] Output length: {len(final_text)}")
+    logger.info(f"[MARKUP] ✅ Converted in {time.time() - start_time:.2f}s")
     logger.info(f"[MARKUP] Preview: {final_text[:200]}...")
     logger.info(f"[MARKUP] ========== END CONVERSION ==========")
     
@@ -354,7 +310,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
     logger.info("[EXTRACT] ========== START EXTRACTION ==========")
-    logger.debug(f"[EXTRACT] Raw message keys: {list(msg.keys())}")
     
     link = msg.get('link', {})
     is_forward = isinstance(link, dict) and link.get('type') == 'forward' and 'message' in link
@@ -499,33 +454,16 @@ class MediaProcessor:
         logger.info(f"[MEDIA] 🔍 atype='{atype}', ext='{ext}', size={meta['size']}, filename='{fname}'")
         if LOG_MEDIA: logger.debug(f"[MEDIA] Full attachment: {json.dumps(att, ensure_ascii=False)[:500]}")
         
-        if atype == 'voice':
-            logger.info(f"[MEDIA] ✅ DETERMINED: voice")
-            return 'voice', meta
-        if atype == 'audio':
-            logger.info(f"[MEDIA] ✅ DETERMINED: audio")
-            return 'audio', meta
-        if atype == 'video':
-            logger.info(f"[MEDIA] ✅ DETERMINED: video")
-            return 'video', meta
-        if atype in ('image', 'photo'):
-            logger.info(f"[MEDIA] ✅ DETERMINED: photo")
-            return 'photo', meta
+        if atype == 'voice': return 'voice', meta
+        if atype == 'audio': return 'audio', meta
+        if atype == 'video': return 'video', meta
+        if atype in ('image', 'photo'): return 'photo', meta
         
-        if ext in self.VOICE_EXTS:
-            logger.info(f"[MEDIA] ✅ DETERMINED: voice (ext .{ext})")
-            return 'voice', meta
-        if ext in self.AUDIO_EXTS:
-            logger.info(f"[MEDIA] ✅ DETERMINED: audio (ext .{ext})")
-            return 'audio', meta
-        if ext in self.PHOTO_EXTS:
-            logger.info(f"[MEDIA] ✅ DETERMINED: photo (ext .{ext})")
-            return 'photo', meta
-        if ext in self.VIDEO_EXTS:
-            logger.info(f"[MEDIA] ✅ DETERMINED: video (ext .{ext})")
-            return 'video', meta
+        if ext in self.VOICE_EXTS: return 'voice', meta
+        if ext in self.AUDIO_EXTS: return 'audio', meta
+        if ext in self.PHOTO_EXTS: return 'photo', meta
+        if ext in self.VIDEO_EXTS: return 'video', meta
         
-        logger.info(f"[MEDIA] 📄 DETERMINED: document")
         return 'document', meta
 
 # ===================================================================
@@ -579,62 +517,6 @@ class TG:
         resp = await self._request('sendMessage', json={'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML'})
         return resp and resp.get('ok', False)
 
-    async def send_media_group_direct(self, items: List[Dict]) -> bool:
-        if not items: return True
-        if len(items) > 10: items = items[:10]
-        logger.info(f"[TG] 📤 Media group (direct URLs): {len(items)} items")
-        
-        input_media = []
-        for i, item in enumerate(items):
-            obj = {'type': item['type'], 'media': item['media']}
-            if i == 0 and item.get('caption'):
-                obj['caption'] = fix_broken_html(item['caption'])[:1024]
-                obj['parse_mode'] = 'HTML'
-            input_media.append(obj)
-            logger.debug(f"[TG]   Item {i}: {item['type']}, media={str(item['media'])[:50]}...")
-        
-        resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
-        if resp and isinstance(resp, dict) and resp.get('ok'):
-            msg_ids = [r.get('message_id') for r in resp.get('result', [])]
-            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
-            return True
-        return False
-
-    async def send_media_group_via_download(self, items: List[Dict], caption: str = None) -> bool:
-        if not items: return True
-        if len(items) > 10: items = items[:10]
-        logger.info(f"[TG] 📤 Media group (via download): {len(items)} items")
-        
-        input_media = []
-        for i, item in enumerate(items):
-            form = aiohttp.FormData()
-            form.add_field('chat_id', self.chat_id)
-            field = 'photo' if item['type'] == 'photo' else 'video'
-            form.add_field(field, item['data'], filename=item.get('filename', f'{field}.jpg'))
-            upload_resp = await self._request(f'send{field.capitalize()}', data=form)
-            
-            if not upload_resp or not upload_resp.get('ok'):
-                logger.error(f"[TG] Failed to upload {field}")
-                return False
-            
-            file_id = upload_resp['result'][field][0]['file_id'] if field == 'photo' else upload_resp['result']['video']['file_id']
-            obj = {'type': item['type'], 'media': file_id}
-            if i == 0 and caption:
-                obj['caption'] = fix_broken_html(caption)[:1024]
-                obj['parse_mode'] = 'HTML'
-            input_media.append(obj)
-            
-            msg_id = upload_resp['result']['message_id']
-            await self._request('deleteMessage', json={'chat_id': self.chat_id, 'message_id': msg_id})
-            logger.debug(f"[TG]   Uploaded {field}, file_id={file_id}, deleted temp msg {msg_id}")
-        
-        resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
-        if resp and isinstance(resp, dict) and resp.get('ok'):
-            msg_ids = [r.get('message_id') for r in resp.get('result', [])]
-            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
-            return True
-        return False
-
     async def send_media(self, media_type: str, media_data, caption="", filename="", is_url=False, **extra) -> bool:
         method_map = {'photo': 'sendPhoto', 'video': 'sendVideo', 'audio': 'sendAudio', 'voice': 'sendVoice', 'document': 'sendDocument'}
         method = method_map.get(media_type, 'sendDocument')
@@ -687,13 +569,8 @@ class MX:
         await self.init()
         logger.info(f"[MAX] 🔗 Registering webhook for chat {self.cid}: {webhook_url}")
         
-        body = {
-            "url": webhook_url,
-            "chat_id": self.cid,
-            "update_types": ["message_created"]
-        }
-        if secret:
-            body["secret"] = secret
+        body = {"url": webhook_url, "chat_id": self.cid, "update_types": ["message_created"]}
+        if secret: body["secret"] = secret
         
         headers = {'Authorization': self.token, 'Content-Type': 'application/json'}
         logger.debug(f"[MAX] Request body: {json.dumps(body, ensure_ascii=False)}")
@@ -726,7 +603,12 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     tg_type, meta = media_proc.determine(att)
     logger.info(f"[ATT] Type: {tg_type}, filename: {meta.get('filename')}, size: {meta.get('size')}")
     
+    # ПРАВИЛЬНОЕ ИЗВЛЕЧЕНИЕ URL
     direct_url = meta.get('url')
+    if not direct_url:
+        payload = att.get('payload', {})
+        direct_url = payload.get('url')
+    
     if not direct_url:
         logger.error("[ATT] ❌ No direct URL in payload")
         return False
@@ -794,43 +676,13 @@ async def handle_max_message(msg: Dict):
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
-    use_new = False
-    if len(media_items) > 1:
-        has_v = any(i['type']=='video' for i in media_items)
-        has_p = any(i['type']=='photo' for i in media_items)
-        if has_v and (has_p or sum(1 for i in media_items if i['type']=='video') >= 2):
-            use_new = True
-            logger.info("[HANDLE] 🔄 Using NEW scheme (mixed/video group)")
-
+    # ОТПРАВЛЯЕМ МЕДИА ПО ОДНОМУ (БЕЗ MEDIA GROUP, ЧТОБЫ ИЗБЕЖАТЬ ДУБЛЕЙ)
     if media_items:
-        if len(media_items) == 1:
-            logger.info("[HANDLE] 📷 Single media, sending directly")
-            await process_attachment(media_items[0]['attachment'], text)
-        elif use_new:
-            downloaded = []
-            for item in media_items:
-                url = item['meta'].get('url')
-                if not url: continue
-                data = await download_from_url(url)
-                if data: 
-                    downloaded.append({'type': item['type'], 'data': data, 'filename': safe_filename(item['meta'].get('filename', ''))})
-            if downloaded:
-                ok = await tg.send_media_group_via_download(downloaded, text)
-                if not ok:
-                    logger.warning("[HANDLE] Media group failed, sending individually...")
-                    for i, item in enumerate(downloaded):
-                        await tg.send_media(item['type'], item['data'], caption=text if i==0 else "", filename=item['filename'])
-                        await asyncio.sleep(0.3)
-        else:
-            items = [{'type': i['type'], 'media': i['meta'].get('url'), 'caption': text if idx==0 else None} 
-                     for idx, i in enumerate(media_items) if i['meta'].get('url')]
-            if items:
-                ok = await tg.send_media_group_direct(items)
-                if not ok:
-                    logger.warning("[HANDLE] Media group failed, sending individually...")
-                    for i, item in enumerate(media_items):
-                        await process_attachment(item['attachment'], text if i==0 else "")
-                        await asyncio.sleep(0.3)
+        for i, item in enumerate(media_items):
+            caption = text if i == 0 else ""
+            logger.info(f"[HANDLE] Sending media {i+1}/{len(media_items)}")
+            await process_attachment(item['attachment'], caption)
+            await asyncio.sleep(0.3)
     elif text:
         await tg.send_text(text)
         await asyncio.sleep(0.3)
@@ -858,7 +710,7 @@ async def webhook_handler(request):
     if VERIFY_WEBHOOK_SECRET and MAX_WEBHOOK_SECRET:
         secret = request.headers.get('X-Max-Bot-Api-Secret')
         if secret != MAX_WEBHOOK_SECRET:
-            logger.warning(f"[WEBHOOK] ❌ Invalid secret: {secret[:10] if secret else 'None'}...")
+            logger.warning(f"[WEBHOOK] ❌ Invalid secret")
             return web.Response(status=403)
         logger.info("[WEBHOOK] ✅ Secret verified")
     
@@ -885,13 +737,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-utf16-universal'})
+    return web.json_response({'ok': True, 'version': 'final-fixed'})
 
 # ===================================================================
 # 15. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - UTF16 UNIVERSAL]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL FIXED]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
