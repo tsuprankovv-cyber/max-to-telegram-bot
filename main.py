@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЕМ ПОРЯДКА ТЕГОВ
+ФИНАЛЬНАЯ ВЕРСИЯ С УНИВЕРСАЛЬНОЙ КОРРЕКЦИЕЙ OFFSET
+- Коррекция offset через UTF-16 (универсальное решение)
 - Фильтрация вложенных сущностей одного типа
 - Сортировка по убыванию длины (внешние теги раньше)
-- Автокоррекция offset
 - Полное логирование
 - Гибридная отправка медиа
 - Транслитерация имён файлов
@@ -65,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - CORRECT TAG ORDER]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - UTF16 UNIVERSAL OFFSET]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -125,7 +125,52 @@ def safe_filename(filename: str) -> str:
     return f"{safe_name}.{ext}" if ext else safe_name
 
 # ===================================================================
-# 4. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ ОДНОГО ТИПА
+# 4. УНИВЕРСАЛЬНАЯ КОРРЕКЦИЯ OFFSET ЧЕРЕЗ UTF-16
+# ===================================================================
+def get_utf16_length(text: str) -> int:
+    """Возвращает длину текста в UTF-16 кодовых единицах."""
+    return len(text.encode('utf-16-le')) // 2
+
+def normalize_max_offset(text: str, max_offset: int, max_length: int = None) -> Tuple[int, int]:
+    """
+    Корректирует offset от MAX (UTF-16) в offset Python (code points).
+    Возвращает (python_offset, python_length).
+    """
+    python_offset = 0
+    utf16_pos = 0
+    
+    # Находим Python offset
+    for i, char in enumerate(text):
+        if utf16_pos >= max_offset:
+            python_offset = i
+            break
+        utf16_pos += len(char.encode('utf-16-le')) // 2
+    else:
+        python_offset = len(text)
+    
+    if max_length is not None:
+        python_length = 0
+        utf16_end = max_offset + max_length
+        utf16_pos = max_offset
+        
+        for i in range(python_offset, len(text)):
+            if utf16_pos >= utf16_end:
+                break
+            utf16_pos += len(text[i].encode('utf-16-le')) // 2
+            python_length += 1
+        
+        if python_offset != max_offset or python_length != max_length:
+            logger.warning(f"[MARKUP] 🔧 Offset corrected: MAX=[{max_offset}:{max_offset+max_length}] -> Python=[{python_offset}:{python_offset+python_length}]")
+        
+        return python_offset, python_length
+    
+    if python_offset != max_offset:
+        logger.warning(f"[MARKUP] 🔧 Offset corrected: MAX={max_offset} -> Python={python_offset}")
+    
+    return python_offset, max_length
+
+# ===================================================================
+# 5. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ ОДНОГО ТИПА
 # ===================================================================
 def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     """Удаляет вложенные сущности одного типа."""
@@ -159,7 +204,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     return filtered
 
 # ===================================================================
-# 5. КОНВЕРТАЦИЯ РАЗМЕТКИ (С ПРАВИЛЬНЫМ ПОРЯДКОМ ТЕГОВ)
+# 6. КОНВЕРТАЦИЯ РАЗМЕТКИ (С УНИВЕРСАЛЬНОЙ КОРРЕКЦИЕЙ)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -189,7 +234,8 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     markup = filter_overlapping_same_type(markup)
     
     logger.info(f"[MARKUP] ========== START CONVERSION ==========")
-    logger.info(f"[MARKUP] Text length: {len(text)}")
+    logger.info(f"[MARKUP] Text length (Python): {len(text)}")
+    logger.info(f"[MARKUP] Text length (UTF-16): {get_utf16_length(text)}")
     logger.info(f"[MARKUP] Text preview: {text[:100]}...")
     logger.info(f"[MARKUP] Entities count (filtered): {len(markup)}")
     
@@ -198,25 +244,20 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     start_time = time.time()
     
-    # 1. Корректируем offset для всех сущностей
+    # 1. Корректируем offset через UTF-16
     corrected_markup = []
     for entity in markup:
         entity = entity.copy()
         max_offset = entity.get('from', 0)
         max_length = entity.get('length', 0)
-        etype = entity.get('type', '')
         
-        if max_offset > 0 and max_length > 0 and max_offset + max_length <= len(text):
-            fragment = text[max_offset:max_offset + max_length]
-            if fragment:
-                real_offset = text.find(fragment)
-                if real_offset != -1 and real_offset != max_offset:
-                    logger.warning(f"[MARKUP] 🔧 Offset corrected for '{fragment}': MAX={max_offset} -> REAL={real_offset}")
-                    entity['from'] = real_offset
+        python_offset, python_length = normalize_max_offset(text, max_offset, max_length)
+        entity['from'] = python_offset
+        entity['length'] = python_length
         
         corrected_markup.append(entity)
     
-    # 2. Сортируем: сначала по offset, потом по убыванию длины (внешние теги раньше)
+    # 2. Сортируем: сначала по offset, потом по убыванию длины
     sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), -m.get('length', 0)))
     
     # 3. Присваиваем order
@@ -309,7 +350,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     return final_text
 
 # ===================================================================
-# 6. ИЗВЛЕЧЕНИЕ ДАННЫХ
+# 7. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
     logger.info("[EXTRACT] ========== START EXTRACTION ==========")
@@ -343,7 +384,7 @@ def extract_message_data(msg: Dict) -> Dict:
     return result
 
 # ===================================================================
-# 7. АУДИО УТИЛИТЫ
+# 8. АУДИО УТИЛИТЫ
 # ===================================================================
 def get_audio_duration(file_path: str) -> int:
     try:
@@ -411,7 +452,7 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     return ogg_data
 
 # ===================================================================
-# 8. СКАЧИВАНИЕ ПО URL
+# 9. СКАЧИВАНИЕ ПО URL
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
     if not url: return None
@@ -432,7 +473,7 @@ async def download_from_url(url: str) -> Optional[bytes]:
         return None
 
 # ===================================================================
-# 9. MEDIA PROCESSOR
+# 10. MEDIA PROCESSOR
 # ===================================================================
 class MediaProcessor:
     PHOTO_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'tiff'}
@@ -488,7 +529,7 @@ class MediaProcessor:
         return 'document', meta
 
 # ===================================================================
-# 10. TELEGRAM CLIENT
+# 11. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -631,7 +672,7 @@ class TG:
         return resp and resp.get('ok', False)
 
 # ===================================================================
-# 11. MAX CLIENT
+# 12. MAX CLIENT
 # ===================================================================
 class MX:
     def __init__(self, token: str, cid: str, base: str):
@@ -668,7 +709,7 @@ class MX:
             return False
 
 # ===================================================================
-# 12. ОБРАБОТЧИКИ
+# 13. ОБРАБОТЧИКИ
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -803,7 +844,7 @@ async def handle_max_message(msg: Dict):
     logger.info("=" * 80)
 
 # ===================================================================
-# 13. WEBHOOK HANDLER
+# 14. WEBHOOK HANDLER
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
@@ -844,13 +885,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-correct-order'})
+    return web.json_response({'ok': True, 'version': 'final-utf16-universal'})
 
 # ===================================================================
-# 14. ЗАПУСК
+# 15. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - CORRECT ORDER]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - UTF16 UNIVERSAL]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
