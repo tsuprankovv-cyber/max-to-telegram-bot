@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ
-- Возвращена рабочая логика process_attachment и handle_max_message
-- Сохранён исправленный apply_markup с LIFO
-- Сохранена коррекция offset через UTF-16
-- Аудио/документы/голосовые работают
+ФИНАЛЬНАЯ ВЕРСИЯ СО ВСЕМИ ИСПРАВЛЕНИЯМИ
+- Исправлен LIFO для комбинаций форматирований (reversed)
+- Возвращена media group для коллажей (без дублей)
+- Аудио конвертируется в голосовое только если type='voice'
+- Коррекция offset через UTF-16
 - Полное логирование
 - Транслитерация имён файлов
 """
@@ -65,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WORKING VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL ALL FIXES]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -276,8 +276,9 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     for i, char in enumerate(text):
         if i in tag_ends:
-            for open_tag in tag_ends[i]:
-                if open_tag in open_tags:
+            # ИСПРАВЛЕНИЕ: закрываем в ОБРАТНОМ порядке (LIFO)
+            for open_tag in reversed(open_tags):
+                if open_tag in tag_ends[i]:
                     open_tags.remove(open_tag)
                     close_tag = open_tag.replace('<', '</')
                     result.append(close_tag)
@@ -512,6 +513,26 @@ class TG:
         resp = await self._request('sendMessage', json={'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML'})
         return resp and resp.get('ok', False)
 
+    async def send_media_group_direct(self, items: List[Dict], caption: str = None) -> bool:
+        if not items: return True
+        if len(items) > 10: items = items[:10]
+        logger.info(f"[TG] 📤 Media group: {len(items)} items")
+        
+        input_media = []
+        for i, item in enumerate(items):
+            obj = {'type': item['type'], 'media': item['media']}
+            if i == 0 and caption:
+                obj['caption'] = fix_broken_html(caption)[:1024]
+                obj['parse_mode'] = 'HTML'
+            input_media.append(obj)
+        
+        resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
+        if resp and isinstance(resp, dict) and resp.get('ok'):
+            msg_ids = [r.get('message_id') for r in resp.get('result', [])]
+            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
+            return True
+        return False
+
     async def send_media(self, media_type: str, media_data, caption="", filename="", is_url=False, **extra) -> bool:
         method_map = {'photo': 'sendPhoto', 'video': 'sendVideo', 'audio': 'sendAudio', 'voice': 'sendVoice', 'document': 'sendDocument'}
         method = method_map.get(media_type, 'sendDocument')
@@ -581,7 +602,7 @@ class MX:
             return False
 
 # ===================================================================
-# 13. ОБРАБОТЧИКИ (ВОЗВРАЩЕНА РАБОЧАЯ ВЕРСИЯ)
+# 13. ОБРАБОТЧИКИ
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -595,15 +616,12 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         logger.warning("[ATT] ❌ Not a dict, skipping")
         return False
     
-    # ВСЕГДА определяем тип внутри
     tg_type, meta = media_proc.determine(att)
     
     logger.info(f"[ATT] Type: {tg_type}, filename: {meta.get('filename')}, size: {meta.get('size')}")
     
-    # Прямая ссылка из meta
     direct_url = meta.get('url')
     if not direct_url:
-        # Fallback: из payload
         payload = att.get('payload', {})
         direct_url = payload.get('url')
     
@@ -625,11 +643,13 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         return False
     
     extra = {}
-    if tg_type == 'audio' and meta.get('size', 0) < 2*1024*1024 and media_proc.ffmpeg_ok:
-        logger.info(f"[ATT] 🎤 Trying voice conversion...")
+    # ИСПРАВЛЕНИЕ: конвертируем в голосовое ТОЛЬКО если type='voice'
+    if meta.get('original_type') == 'voice' and media_proc.ffmpeg_ok:
+        logger.info(f"[ATT] 🎤 Converting voice...")
         voice_data = convert_to_voice(file_data)
         if voice_data:
-            tg_type, file_data = 'voice', voice_data
+            tg_type = 'voice'
+            file_data = voice_data
             with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
                 tmp.write(voice_data)
                 extra['duration'] = get_audio_duration(tmp.name)
@@ -669,18 +689,40 @@ async def handle_max_message(msg: Dict):
 
     media_items, other = [], []
     for att in data['attachments']:
-        t, _ = media_proc.determine(att)
-        (media_items if t in ('photo', 'video') else other).append(att)
+        t, m = media_proc.determine(att)
+        if t in ('photo', 'video'):
+            media_items.append({'type': t, 'attachment': att, 'meta': m})
+        else:
+            other.append(att)
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
-    # Отправляем медиа по одному
+    # ИСПРАВЛЕНИЕ: возвращаем media group для коллажей
     if media_items:
-        for i, att in enumerate(media_items):
-            caption = text if i == 0 else ""
-            logger.info(f"[HANDLE] Sending media {i+1}/{len(media_items)}")
-            await process_attachment(att, caption)
-            await asyncio.sleep(0.3)
+        if len(media_items) == 1:
+            # Одиночное фото/видео
+            logger.info("[HANDLE] 📷 Single media, sending directly")
+            await process_attachment(media_items[0]['attachment'], text)
+        else:
+            # Группа — пробуем media group
+            logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items")
+            items = []
+            for item in media_items:
+                url = item['meta'].get('url')
+                if url:
+                    items.append({'type': item['type'], 'media': url})
+            
+            if items:
+                ok = await tg.send_media_group_direct(items, text)
+                if ok:
+                    logger.info("[HANDLE] ✅ Media group sent successfully")
+                else:
+                    # Если не получилось — отправляем по одному (без дублей!)
+                    logger.warning("[HANDLE] Media group failed, sending individually")
+                    for i, item in enumerate(media_items):
+                        caption = text if i == 0 else ""
+                        await process_attachment(item['attachment'], caption)
+                        await asyncio.sleep(0.3)
     elif text:
         await tg.send_text(text)
         await asyncio.sleep(0.3)
@@ -736,13 +778,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-working'})
+    return web.json_response({'ok': True, 'version': 'final-all-fixes'})
 
 # ===================================================================
 # 15. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL WORKING]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL ALL FIXES]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
