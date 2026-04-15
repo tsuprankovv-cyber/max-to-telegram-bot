@@ -2,14 +2,13 @@
 """
 MAX → Telegram Forwarder
 ФИНАЛЬНАЯ ВЕРСИЯ
-- Графемная конвертация offset (эмодзи не сбивают форматирование)
-- Стековая обработка вложенных тегов
-- Markdown-парсер как fallback
-- Гибридная отправка медиа:
-  * Старая схема (прямые URL) для фото-коллажей и одиночных медиа
-  * Новая схема (скачивание + file_id) для фото+видео и видео+видео
+- Правильная обработка вложенных и пересекающихся тегов (LIFO)
+- Прямые offset без графем (эмодзи не сбивают)
+- Исправлены дубли при отправке одиночного фото
+- Гибридная отправка медиа (старая/новая схема)
 - Приоритет имени файла для аудио
 - Транслитерация кириллицы
+- Полное логирование ответов Telegram
 """
 import os
 import sys
@@ -67,7 +66,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL HYBRID VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION - LIFO MARKUP]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -151,37 +150,8 @@ def safe_filename(filename: str) -> str:
     return safe_name
 
 
-def split_into_graphemes(text: str) -> List[str]:
-    """Разбивает текст на графемы для корректной работы с эмодзи."""
-    if not text:
-        return []
-    graphemes = []
-    i = 0
-    while i < len(text):
-        char = text[i]
-        if ('\U0001F300' <= char <= '\U0001F9FF' or
-            '\U00002600' <= char <= '\U000026FF' or
-            '\U00002700' <= char <= '\U000027BF'):
-            j = i + 1
-            while j < len(text):
-                next_char = text[j]
-                if ('\U0001F3FB' <= next_char <= '\U0001F3FF' or
-                    next_char == '\u200D' or
-                    next_char in '\uFE0E\uFE0F'):
-                    char += next_char
-                    j += 1
-                else:
-                    break
-            graphemes.append(char)
-            i = j
-        else:
-            graphemes.append(char)
-            i += 1
-    return graphemes
-
-
 # ===================================================================
-# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ MAX → HTML
+# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ MAX → HTML (СТЕКОВАЯ ОБРАБОТКА)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -207,6 +177,10 @@ def parse_markdown_to_html(text: str) -> str:
 
 
 def apply_markup(text: str, markup: List[Dict]) -> str:
+    """
+    Конвертирует разметку MAX в HTML для Telegram.
+    Использует стековую обработку для правильной вложенности тегов.
+    """
     if not markup or not text:
         return text
     
@@ -220,98 +194,79 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     logger.info(f"[MARKUP] Converting: text_len={len(text)}, entities={len(markup)}")
     start_time = time.time()
     
-    cleaned_text = text
-    for entity in markup:
-        etype = entity.get('type', '')
-        offset = entity.get('from', 0)
-        length = entity.get('length', 0)
-        if etype in ('emphasized', 'italic', 'em', 'i') and offset > 0 and offset + length < len(cleaned_text):
-            if cleaned_text[offset-1] == '*' and cleaned_text[offset+length] == '*':
-                cleaned_text = cleaned_text[:offset-1] + cleaned_text[offset:offset+length] + cleaned_text[offset+length+1:]
-                for e in markup:
-                    if e.get('from', 0) > offset:
-                        e['from'] = e['from'] - 2
-                entity['from'] = offset - 1
-    
-    graphemes = split_into_graphemes(cleaned_text)
-    n = len(graphemes)
-    
-    char_to_grapheme = []
-    for g_idx, g in enumerate(graphemes):
-        char_to_grapheme.extend([g_idx] * len(g))
-    
-    def char_offset_to_grapheme(char_offset: int) -> int:
-        if char_offset <= 0:
-            return 0
-        if char_offset >= len(char_to_grapheme):
-            return n
-        return char_to_grapheme[char_offset]
-    
-    opens_at = [set() for _ in range(n + 1)]
-    closes_at = [set() for _ in range(n + 1)]
-    link_attrs = {}
-    
+    # Создаём события открытия и закрытия тегов
+    events = []
     for idx, entity in enumerate(markup):
         try:
-            char_offset = int(entity.get('from', 0))
-            char_length = int(entity.get('length', 0))
+            offset = int(entity.get('from', 0))
+            length = int(entity.get('length', 0))
             etype = entity.get('type', '')
             
-            offset = char_offset_to_grapheme(char_offset)
-            end_offset = char_offset_to_grapheme(char_offset + char_length)
-            length = end_offset - offset
-            
-            if offset < 0 or length <= 0 or offset + length > n:
+            if offset < 0 or length <= 0 or offset + length > len(text):
                 continue
             
             if etype not in MAX_TAG_MAP:
                 continue
             
             tag_name = MAX_TAG_MAP[etype]
-            opens_at[offset].add(tag_name)
-            closes_at[offset + length].add(tag_name)
             
             if etype in ('link', 'text_link', 'url'):
                 url = entity.get('url') or entity.get('href') or ''
                 if url:
                     url_safe = url.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-                    link_attrs[(offset, tag_name)] = f' href="{url_safe}"'
+                    open_tag = f'<{tag_name} href="{url_safe}">'
+                else:
+                    open_tag = f'<{tag_name}>'
+            else:
+                open_tag = f'<{tag_name}>'
+            
+            close_tag = f'</{tag_name}>'
+            
+            events.append((offset, 'open', open_tag, close_tag, idx))
+            events.append((offset + length, 'close', open_tag, close_tag, idx))
+            
+            logger.debug(f"[MARKUP] {etype}: [{offset}:{offset+length}] -> <{tag_name}>")
             
         except Exception as e:
             logger.error(f"[MARKUP] Error: {e}")
     
+    # Сортируем: сначала по позиции, закрывающие перед открывающими
+    events.sort(key=lambda x: (x[0], 0 if x[1] == 'close' else 1, -x[4]))
+    
     result = []
-    open_stack = []
-    tag_order = ['b', 'i', 'u', 's', 'code', 'pre', 'tg-spoiler', 'a']
+    open_stack = []  # Стек открытых тегов: [(close_tag, priority), ...]
+    event_idx = 0
+    n = len(text)
     
     for pos in range(n + 1):
-        if closes_at[pos]:
-            to_close = []
-            for tag in reversed(open_stack):
-                if tag in closes_at[pos]:
-                    to_close.append(tag)
-            for tag in to_close:
-                result.append(f'</{tag}>')
-                open_stack.remove(tag)
+        # Обрабатываем все события на текущей позиции
+        while event_idx < len(events) and events[event_idx][0] == pos:
+            _, etype, open_tag, close_tag, priority = events[event_idx]
+            if etype == 'close':
+                # Ищем соответствующий открывающий тег в стеке
+                for i in range(len(open_stack) - 1, -1, -1):
+                    if open_stack[i][0] == close_tag and open_stack[i][1] == priority:
+                        result.append(close_tag)
+                        open_stack.pop(i)
+                        break
+            else:
+                open_stack.append((close_tag, priority))
+                result.append(open_tag)
+            event_idx += 1
         
-        if opens_at[pos]:
-            sorted_tags = sorted(opens_at[pos], key=lambda t: tag_order.index(t) if t in tag_order else 999)
-            for tag_name in sorted_tags:
-                if tag_name not in open_stack:
-                    key = (pos, tag_name)
-                    attrs = link_attrs.get(key, '')
-                    result.append(f'<{tag_name}{attrs}>')
-                    open_stack.append(tag_name)
-        
+        # Добавляем символ
         if pos < n:
-            result.append(graphemes[pos])
+            result.append(text[pos])
     
-    for tag_name in reversed(open_stack):
-        result.append(f'</{tag_name}>')
+    # Закрываем оставшиеся теги
+    for close_tag, _ in reversed(open_stack):
+        result.append(close_tag)
     
     final_text = ''.join(result)
     elapsed = time.time() - start_time
-    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s")
+    logger.info(f"[MARKUP] ✅ Converted in {elapsed:.2f}s: {len(text)} → {len(final_text)} chars")
+    logger.debug(f"[MARKUP] Preview: {final_text[:200]}...")
+    
     return final_text
 
 
@@ -586,7 +541,7 @@ class MediaProcessor:
 
 
 # ===================================================================
-# 9. TELEGRAM CLIENT
+# 9. TELEGRAM CLIENT (С ПОЛНЫМ ЛОГИРОВАНИЕМ)
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -609,7 +564,7 @@ class TG:
                 logger.info(f"[TG] Status: {r.status}")
                 
                 if LOG_RAW_TG:
-                    logger.info(f"[TG-RESP] {txt[:500]}")
+                    logger.info(f"[TG-RESP] {txt}")  # ПОЛНЫЙ ОТВЕТ БЕЗ ОБРЕЗКИ
                 
                 try:
                     resp = json.loads(txt)
@@ -639,7 +594,7 @@ class TG:
             return True
         
         text = fix_broken_html(text)
-        logger.info(f"[TG] 📤 Sending text: {text[:50]}...")
+        logger.info(f"[TG] 📤 Sending text: {text[:100]}...")
         
         resp = await self._request('sendMessage', json={
             'chat_id': self.chat_id,
@@ -675,7 +630,14 @@ class TG:
             'media': input_media
         })
         
-        return resp is not None and resp.get('ok', False)
+        if resp and isinstance(resp, dict) and resp.get('ok'):
+            results = resp.get('result', [])
+            msg_ids = [res.get('message_id') for res in results if isinstance(res, dict)]
+            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
+            return True
+        
+        logger.error(f"[TG] ❌ Media group failed")
+        return False
     
     async def send_media_group_via_download(self, media_items: List[Dict], caption: str = None) -> bool:
         """Новая схема: скачанные файлы -> загрузка в Telegram -> media group по file_id."""
@@ -732,7 +694,14 @@ class TG:
             'media': input_media
         })
         
-        return resp is not None and resp.get('ok', False)
+        if resp and isinstance(resp, dict) and resp.get('ok'):
+            results = resp.get('result', [])
+            msg_ids = [res.get('message_id') for res in results if isinstance(res, dict)]
+            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
+            return True
+        
+        logger.error(f"[TG] ❌ Media group failed")
+        return False
     
     async def send_media(self, media_type: str, media_data: Union[str, bytes],
                          caption: str = "", filename: str = "", 
@@ -907,7 +876,7 @@ async def handle_max_message(msg: Dict):
     logger.info(f"[HANDLE] 🚀 Processing MAX message at {time.strftime('%H:%M:%S')}")
 
     if LOG_RAW_MAX:
-        logger.debug(f"[HANDLE] Raw message: {json.dumps(msg, ensure_ascii=False)[:1500]}")
+        logger.debug(f"[HANDLE] Raw message: {json.dumps(msg, ensure_ascii=False)[:2000]}")
 
     data = extract_message_data(msg)
 
@@ -935,7 +904,6 @@ async def handle_max_message(msg: Dict):
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other_attachments)}")
 
-    # --- ОПРЕДЕЛЯЕМ, НУЖНА ЛИ НОВАЯ СХЕМА ---
     use_new_scheme = False
     if len(media_items) > 1:
         has_video = any(item['type'] == 'video' for item in media_items)
@@ -947,11 +915,15 @@ async def handle_max_message(msg: Dict):
             logger.info(f"[HANDLE] 🔄 Using NEW scheme (download + file_id) for mixed/video group")
         else:
             logger.info(f"[HANDLE] 📷 Using OLD scheme (direct URLs) for photo collage")
-    elif len(media_items) == 1:
-        logger.info(f"[HANDLE] 📷 Using OLD scheme (direct URL) for single media")
 
     if media_items:
-        if use_new_scheme:
+        if len(media_items) == 1:
+            # ОДИНОЧНОЕ ФОТО/ВИДЕО — без media group!
+            item = media_items[0]
+            logger.info(f"[HANDLE] 📷 Single media, sending via send_media...")
+            caption = text
+            await process_attachment(item['attachment'], caption)
+        elif use_new_scheme:
             downloaded_media = []
             for item in media_items:
                 att = item['attachment']
@@ -1042,7 +1014,7 @@ async def webhook_handler(request):
         logger.info(f"[WEBHOOK] 🔑 Keys: {list(body.keys())}")
         
         if LOG_RAW_MAX:
-            logger.debug(f"[WEBHOOK] Full body: {json.dumps(body, ensure_ascii=False)[:2000]}")
+            logger.debug(f"[WEBHOOK] Full body: {json.dumps(body, ensure_ascii=False)[:3000]}")
         
         update_type = body.get('update_type', 'unknown')
         logger.info(f"[WEBHOOK] Update type: {update_type}")
@@ -1071,7 +1043,7 @@ async def health_handler(request):
     return web.json_response({
         'ok': True,
         'service': 'MAX → Telegram Forwarder',
-        'version': 'final-hybrid'
+        'version': 'final-lifo'
     })
 
 
@@ -1079,7 +1051,7 @@ async def health_handler(request):
 # 13. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL HYBRID VERSION]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL LIFO VERSION]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
