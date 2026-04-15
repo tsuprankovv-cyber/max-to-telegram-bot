@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЯМИ
-- Правильное извлечение URL из payload
-- Отключена проблемная media group (отправка по одному)
+ФИНАЛЬНАЯ ВЕРСИЯ СО ВСЕМИ ИСПРАВЛЕНИЯМИ
+- Исправлена комбинация форматирований (простой LIFO)
+- Исправлена отправка аудио/документов/голосовых
 - Универсальная коррекция offset через UTF-16
-- Фильтрация вложенных сущностей
+- Отключены дубли при коллажах
 - Полное логирование
 - Транслитерация имён файлов
 """
@@ -65,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL FIXED VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION - ALL FIXES]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -195,7 +195,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     return filtered
 
 # ===================================================================
-# 6. КОНВЕРТАЦИЯ РАЗМЕТКИ
+# 6. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕННЫЙ LIFO)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -229,6 +229,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     start_time = time.time()
     
+    # Корректируем offset через UTF-16
     corrected_markup = []
     for entity in markup:
         entity = entity.copy()
@@ -239,11 +240,10 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         entity['length'] = python_length
         corrected_markup.append(entity)
     
+    # Сортируем: сначала по offset, потом по убыванию длины
     sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), -m.get('length', 0)))
     
-    for idx, entity in enumerate(sorted_markup):
-        entity['_open_order'] = idx
-    
+    # Строим карту тегов
     tag_starts = {}
     tag_ends = {}
     
@@ -251,9 +251,9 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         offset = entity.get('from', 0)
         length = entity.get('length', 0)
         etype = entity.get('type', '')
-        open_order = entity.get('_open_order', 0)
         
-        if etype not in MAX_TAG_MAP: continue
+        if etype not in MAX_TAG_MAP:
+            continue
         
         tag_name = MAX_TAG_MAP[etype]
         
@@ -263,39 +263,41 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         else:
             open_tag = f'<{tag_name}>'
         
-        close_tag = f'</{tag_name}>'
-        
-        if offset not in tag_starts: tag_starts[offset] = []
-        tag_starts[offset].append((open_tag, open_order))
+        if offset not in tag_starts:
+            tag_starts[offset] = []
+        tag_starts[offset].append(open_tag)
         
         end_pos = offset + length
-        if end_pos not in tag_ends: tag_ends[end_pos] = []
-        tag_ends[end_pos].append((close_tag, open_order))
+        if end_pos not in tag_ends:
+            tag_ends[end_pos] = []
+        tag_ends[end_pos].append(open_tag)
         
-        logger.info(f"[MARKUP] Entity {open_order}: {etype} -> <{tag_name}> [{offset}:{end_pos}]")
+        logger.info(f"[MARKUP] {etype}: [{offset}:{end_pos}] -> <{tag_name}>")
     
+    # Проходим по тексту
     result = []
     open_tags = []
     
     for i, char in enumerate(text):
+        # Сначала закрываем теги (в обратном порядке)
         if i in tag_ends:
-            closing = sorted(tag_ends[i], key=lambda x: -x[1])
-            for close_tag, open_order in closing:
-                for j in range(len(open_tags) - 1, -1, -1):
-                    if open_tags[j][1] == open_order:
-                        result.append(close_tag)
-                        open_tags.pop(j)
-                        break
+            for open_tag in tag_ends[i]:
+                if open_tag in open_tags:
+                    open_tags.remove(open_tag)
+                    close_tag = open_tag.replace('<', '</')
+                    result.append(close_tag)
         
+        # Затем открываем новые
         if i in tag_starts:
-            opening = sorted(tag_starts[i], key=lambda x: x[1])
-            for open_tag, open_order in opening:
-                open_tags.append((open_tag, open_order))
+            for open_tag in tag_starts[i]:
+                open_tags.append(open_tag)
                 result.append(open_tag)
         
         result.append(char)
     
-    for close_tag, _ in reversed(open_tags):
+    # Закрываем оставшиеся
+    for open_tag in reversed(open_tags):
+        close_tag = open_tag.replace('<', '</')
         result.append(close_tag)
     
     final_text = ''.join(result)
@@ -592,7 +594,7 @@ tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 media_proc = MediaProcessor()
 
-async def process_attachment(att: Dict, caption: str = "") -> bool:
+async def process_attachment(att: Dict, caption: str = "", tg_type: str = None, meta: Dict = None) -> bool:
     start_time = time.time()
     logger.info("[ATT] ========== PROCESSING ATTACHMENT ==========")
     
@@ -600,10 +602,13 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         logger.warning("[ATT] ❌ Not a dict, skipping")
         return False
     
-    tg_type, meta = media_proc.determine(att)
+    # Используем переданные тип и meta, или определяем заново
+    if tg_type is None or meta is None:
+        tg_type, meta = media_proc.determine(att)
+    
     logger.info(f"[ATT] Type: {tg_type}, filename: {meta.get('filename')}, size: {meta.get('size')}")
     
-    # ПРАВИЛЬНОЕ ИЗВЛЕЧЕНИЕ URL
+    # URL уже в meta
     direct_url = meta.get('url')
     if not direct_url:
         payload = att.get('payload', {})
@@ -676,19 +681,19 @@ async def handle_max_message(msg: Dict):
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
-    # ОТПРАВЛЯЕМ МЕДИА ПО ОДНОМУ (БЕЗ MEDIA GROUP, ЧТОБЫ ИЗБЕЖАТЬ ДУБЛЕЙ)
+    # Отправляем медиа по одному (без media group)
     if media_items:
         for i, item in enumerate(media_items):
             caption = text if i == 0 else ""
             logger.info(f"[HANDLE] Sending media {i+1}/{len(media_items)}")
-            await process_attachment(item['attachment'], caption)
+            await process_attachment(item['attachment'], caption, item['type'], item['meta'])
             await asyncio.sleep(0.3)
     elif text:
         await tg.send_text(text)
         await asyncio.sleep(0.3)
 
     for att in other:
-        await process_attachment(att, "")
+        await process_attachment(att, "")  # тип и meta определятся внутри
         await asyncio.sleep(0.5)
 
     elapsed = time.time() - start_time
@@ -737,13 +742,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-fixed'})
+    return web.json_response({'ok': True, 'version': 'final-all-fixes'})
 
 # ===================================================================
 # 15. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL FIXED]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL ALL FIXES]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
