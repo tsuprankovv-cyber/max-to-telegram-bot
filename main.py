@@ -2,9 +2,8 @@
 """
 MAX → Telegram Forwarder
 ФИНАЛЬНАЯ ВЕРСИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ
-- Стековая обработка вложенности тегов (LIFO)
+- Исправлена сортировка закрывающих тегов (LIFO)
 - Прямые offset без графем (эмодзи не сбивают)
-- Исправлены дубли при одиночном фото
 - Гибридная отправка медиа
 - Полное логирование запросов и ответов
 """
@@ -64,7 +63,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL FULL-LOG VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL FIXED VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -124,7 +123,7 @@ def safe_filename(filename: str) -> str:
     return f"{safe_name}.{ext}" if ext else safe_name
 
 # ===================================================================
-# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (СТЕК LIFO, БЕЗ ГРАФЕМ)
+# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕННАЯ СОРТИРОВКА)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -149,7 +148,6 @@ def parse_markdown_to_html(text: str) -> str:
 def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text: return text
     
-    # Проверка на битый markup
     all_from_zero = all(m.get('from', 0) == 0 for m in markup)
     max_length = max((m.get('length', 0) for m in markup), default=0)
     if all_from_zero and max_length < len(text):
@@ -182,6 +180,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         except Exception as e:
             logger.error(f"[MARKUP] Error: {e}")
 
+    # Сортируем события: сначала по позиции, закрывающие перед открывающими
     events.sort(key=lambda x: (x[0], 0 if x[1] == 'close' else 1, -x[4]))
     
     result = []
@@ -190,24 +189,38 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     n = len(text)
     
     for pos in range(n + 1):
+        # Собираем все события на текущей позиции
+        pos_events = []
         while event_idx < len(events) and events[event_idx][0] == pos:
-            _, etype, open_tag, close_tag, priority = events[event_idx]
-            if etype == 'close':
-                for i in range(len(open_stack) - 1, -1, -1):
-                    if open_stack[i][0] == close_tag and open_stack[i][1] == priority:
-                        result.append(close_tag)
-                        open_stack.pop(i)
-                        break
-            else:
-                open_stack.append((close_tag, priority))
-                result.append(open_tag)
+            pos_events.append(events[event_idx])
             event_idx += 1
+        
+        # ВАЖНО: Сортируем события на одной позиции
+        # 1. Сначала ВСЕ закрывающие (в обратном порядке приоритета = LIFO)
+        # 2. Потом ВСЕ открывающие
+        close_events = sorted([e for e in pos_events if e[1] == 'close'], key=lambda x: -x[4])
+        open_events = sorted([e for e in pos_events if e[1] == 'open'], key=lambda x: -x[4])
+        
+        # Обрабатываем закрывающие
+        for _, _, _, close_tag, priority in close_events:
+            for i in range(len(open_stack) - 1, -1, -1):
+                if open_stack[i][0] == close_tag and open_stack[i][1] == priority:
+                    result.append(close_tag)
+                    open_stack.pop(i)
+                    break
+        
+        # Обрабатываем открывающие
+        for _, _, open_tag, close_tag, priority in open_events:
+            open_stack.append((close_tag, priority))
+            result.append(open_tag)
+        
         if pos < n:
             result.append(text[pos])
-            
+    
+    # Закрываем оставшиеся теги
     for close_tag, _ in reversed(open_stack):
         result.append(close_tag)
-        
+    
     final_text = ''.join(result)
     logger.info(f"[MARKUP] ✅ Converted in {time.time() - start_time:.2f}s")
     logger.debug(f"[MARKUP] Preview: {final_text[:200]}...")
@@ -491,15 +504,23 @@ class MX:
     
     async def register_webhook(self, webhook_url: str, secret: str = "") -> bool:
         await self.init()
-        logger.info(f"[MAX] 🔗 Registering webhook: {webhook_url}")
-        body = {"url": webhook_url, "update_types": ["message_created"]}
-        if secret: body["secret"] = secret
+        logger.info(f"[MAX] 🔗 Registering webhook for chat {self.cid}: {webhook_url}")
+        
+        body = {
+            "url": webhook_url,
+            "chat_id": self.cid,
+            "update_types": ["message_created"]
+        }
+        if secret:
+            body["secret"] = secret
+        
+        headers = {'Authorization': self.token, 'Content-Type': 'application/json'}
         
         try:
-            async with self.session.post(f"{self.base}/subscriptions", headers={'Authorization': self.token, 'Content-Type': 'application/json'}, json=body) as r:
+            async with self.session.post(f"{self.base}/subscriptions", headers=headers, json=body) as r:
                 text = await r.text()
                 logger.info(f"[MAX] Response: {r.status}")
-                if LOG_RAW_MAX: logger.debug(f"[MAX-RESP] {text}")
+                logger.info(f"[MAX] Body: {text}")
                 return r.status == 200
         except Exception as e:
             logger.error(f"[MAX] ❌ {e}")
@@ -643,13 +664,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-full-log'})
+    return web.json_response({'ok': True, 'version': 'final-fixed'})
 
 # ===================================================================
 # 13. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL FULL-LOG]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL FIXED]...")
     if RENDER_EXTERNAL_URL:
         await mx.register_webhook(f"{RENDER_EXTERNAL_URL}/webhook", MAX_WEBHOOK_SECRET)
     
