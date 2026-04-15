@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ СО ВСЕМИ ИСПРАВЛЕНИЯМИ
-- Исправлен LIFO для комбинаций форматирований (reversed)
-- Возвращена media group для коллажей (без дублей)
+ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕННОЙ MEDIA GROUP
+- Исправлена обработка ответа sendMediaGroup (убраны дубли)
+- Исправлен LIFO для комбинаций форматирований
+- Возвращена media group для коллажей
 - Аудио конвертируется в голосовое только если type='voice'
 - Коррекция offset через UTF-16
 - Полное логирование
@@ -65,7 +66,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL ALL FIXES]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - FIXED MEDIA GROUP]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -527,10 +528,13 @@ class TG:
             input_media.append(obj)
         
         resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
-        if resp and isinstance(resp, dict) and resp.get('ok'):
-            msg_ids = [r.get('message_id') for r in resp.get('result', [])]
-            logger.info(f"[TG] ✅ Media group sent: message_ids={msg_ids}")
+        
+        # ПРОСТАЯ ПРОВЕРКА БЕЗ ОШИБОК
+        if resp and resp.get('ok'):
+            logger.info(f"[TG] ✅ Media group sent successfully")
             return True
+        
+        logger.error(f"[TG] ❌ Media group failed")
         return False
 
     async def send_media(self, media_type: str, media_data, caption="", filename="", is_url=False, **extra) -> bool:
@@ -643,7 +647,7 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
         return False
     
     extra = {}
-    # ИСПРАВЛЕНИЕ: конвертируем в голосовое ТОЛЬКО если type='voice'
+    # Конвертируем в голосовое ТОЛЬКО если type='voice'
     if meta.get('original_type') == 'voice' and media_proc.ffmpeg_ok:
         logger.info(f"[ATT] 🎤 Converting voice...")
         voice_data = convert_to_voice(file_data)
@@ -697,14 +701,11 @@ async def handle_max_message(msg: Dict):
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
-    # ИСПРАВЛЕНИЕ: возвращаем media group для коллажей
     if media_items:
         if len(media_items) == 1:
-            # Одиночное фото/видео
             logger.info("[HANDLE] 📷 Single media, sending directly")
             await process_attachment(media_items[0]['attachment'], text)
         else:
-            # Группа — пробуем media group
             logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items")
             items = []
             for item in media_items:
@@ -717,7 +718,6 @@ async def handle_max_message(msg: Dict):
                 if ok:
                     logger.info("[HANDLE] ✅ Media group sent successfully")
                 else:
-                    # Если не получилось — отправляем по одному (без дублей!)
                     logger.warning("[HANDLE] Media group failed, sending individually")
                     for i, item in enumerate(media_items):
                         caption = text if i == 0 else ""
@@ -727,7 +727,6 @@ async def handle_max_message(msg: Dict):
         await tg.send_text(text)
         await asyncio.sleep(0.3)
 
-    # Отправляем остальные вложения
     for att in other:
         await process_attachment(att, "")
         await asyncio.sleep(0.5)
@@ -778,13 +777,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-all-fixes'})
+    return web.json_response({'ok': True, 'version': 'final-media-group-fixed'})
 
 # ===================================================================
 # 15. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL ALL FIXES]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL MEDIA GROUP FIXED]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
