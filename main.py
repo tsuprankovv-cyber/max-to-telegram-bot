@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ СО ВСЕМИ ИСПРАВЛЕНИЯМИ
-- Исправлена комбинация форматирований (простой LIFO)
-- Исправлена отправка аудио/документов/голосовых
-- Универсальная коррекция offset через UTF-16
-- Отключены дубли при коллажах
+ФИНАЛЬНАЯ РАБОЧАЯ ВЕРСИЯ
+- Возвращена рабочая логика process_attachment и handle_max_message
+- Сохранён исправленный apply_markup с LIFO
+- Сохранена коррекция offset через UTF-16
+- Аудио/документы/голосовые работают
 - Полное логирование
 - Транслитерация имён файлов
 """
@@ -65,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL VERSION - ALL FIXES]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WORKING VERSION]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -229,7 +229,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     start_time = time.time()
     
-    # Корректируем offset через UTF-16
     corrected_markup = []
     for entity in markup:
         entity = entity.copy()
@@ -240,10 +239,8 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         entity['length'] = python_length
         corrected_markup.append(entity)
     
-    # Сортируем: сначала по offset, потом по убыванию длины
     sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), -m.get('length', 0)))
     
-    # Строим карту тегов
     tag_starts = {}
     tag_ends = {}
     
@@ -274,12 +271,10 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         
         logger.info(f"[MARKUP] {etype}: [{offset}:{end_pos}] -> <{tag_name}>")
     
-    # Проходим по тексту
     result = []
     open_tags = []
     
     for i, char in enumerate(text):
-        # Сначала закрываем теги (в обратном порядке)
         if i in tag_ends:
             for open_tag in tag_ends[i]:
                 if open_tag in open_tags:
@@ -287,7 +282,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                     close_tag = open_tag.replace('<', '</')
                     result.append(close_tag)
         
-        # Затем открываем новые
         if i in tag_starts:
             for open_tag in tag_starts[i]:
                 open_tags.append(open_tag)
@@ -295,7 +289,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         
         result.append(char)
     
-    # Закрываем оставшиеся
     for open_tag in reversed(open_tags):
         close_tag = open_tag.replace('<', '</')
         result.append(close_tag)
@@ -588,13 +581,13 @@ class MX:
             return False
 
 # ===================================================================
-# 13. ОБРАБОТЧИКИ
+# 13. ОБРАБОТЧИКИ (ВОЗВРАЩЕНА РАБОЧАЯ ВЕРСИЯ)
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 media_proc = MediaProcessor()
 
-async def process_attachment(att: Dict, caption: str = "", tg_type: str = None, meta: Dict = None) -> bool:
+async def process_attachment(att: Dict, caption: str = "") -> bool:
     start_time = time.time()
     logger.info("[ATT] ========== PROCESSING ATTACHMENT ==========")
     
@@ -602,15 +595,15 @@ async def process_attachment(att: Dict, caption: str = "", tg_type: str = None, 
         logger.warning("[ATT] ❌ Not a dict, skipping")
         return False
     
-    # Используем переданные тип и meta, или определяем заново
-    if tg_type is None or meta is None:
-        tg_type, meta = media_proc.determine(att)
+    # ВСЕГДА определяем тип внутри
+    tg_type, meta = media_proc.determine(att)
     
     logger.info(f"[ATT] Type: {tg_type}, filename: {meta.get('filename')}, size: {meta.get('size')}")
     
-    # URL уже в meta
+    # Прямая ссылка из meta
     direct_url = meta.get('url')
     if not direct_url:
+        # Fallback: из payload
         payload = att.get('payload', {})
         direct_url = payload.get('url')
     
@@ -676,24 +669,25 @@ async def handle_max_message(msg: Dict):
 
     media_items, other = [], []
     for att in data['attachments']:
-        t, m = media_proc.determine(att)
-        (media_items if t in ('photo', 'video') else other).append({'type': t, 'attachment': att, 'meta': m})
+        t, _ = media_proc.determine(att)
+        (media_items if t in ('photo', 'video') else other).append(att)
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
-    # Отправляем медиа по одному (без media group)
+    # Отправляем медиа по одному
     if media_items:
-        for i, item in enumerate(media_items):
+        for i, att in enumerate(media_items):
             caption = text if i == 0 else ""
             logger.info(f"[HANDLE] Sending media {i+1}/{len(media_items)}")
-            await process_attachment(item['attachment'], caption, item['type'], item['meta'])
+            await process_attachment(att, caption)
             await asyncio.sleep(0.3)
     elif text:
         await tg.send_text(text)
         await asyncio.sleep(0.3)
 
+    # Отправляем остальные вложения
     for att in other:
-        await process_attachment(att, "")  # тип и meta определятся внутри
+        await process_attachment(att, "")
         await asyncio.sleep(0.5)
 
     elapsed = time.time() - start_time
@@ -742,13 +736,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-all-fixes'})
+    return web.json_response({'ok': True, 'version': 'final-working'})
 
 # ===================================================================
 # 15. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL ALL FIXES]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL WORKING]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
