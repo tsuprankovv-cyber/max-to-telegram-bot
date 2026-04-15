@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С МАКСИМАЛЬНЫМ ЛОГИРОВАНИЕМ
+ФИНАЛЬНАЯ ВЕРСИЯ С АВТОКОРРЕКЦИЕЙ OFFSET
+- Автоматический поиск реальной позиции подстроки
 - Гарантированный LIFO порядок закрытия тегов
 - Полное логирование webhook, markup, медиа, Telegram API
 - Гибридная отправка медиа
@@ -63,16 +64,12 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH MAX LOGGING]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH AUTO-OFFSET]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
 logger.info(f"🔐 Webhook Secret: {'SET' if MAX_WEBHOOK_SECRET else 'NOT SET'}")
 logger.info(f"📊 LOG_LEVEL: {LOG_LEVEL}")
-logger.info(f"📊 LOG_RAW_MAX: {LOG_RAW_MAX}")
-logger.info(f"📊 LOG_RAW_TG: {LOG_RAW_TG}")
-logger.info(f"📊 LOG_MARKUP: {LOG_MARKUP}")
-logger.info(f"📊 LOG_MEDIA: {LOG_MEDIA}")
 logger.info("=" * 100)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
@@ -132,7 +129,7 @@ def safe_filename(filename: str) -> str:
     return f"{safe_name}.{ext}" if ext else safe_name
 
 # ===================================================================
-# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (ГАРАНТИРОВАННЫЙ LIFO)
+# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (С АВТОКОРРЕКЦИЕЙ OFFSET)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -158,7 +155,7 @@ def parse_markdown_to_html(text: str) -> str:
 def apply_markup(text: str, markup: List[Dict]) -> str:
     """
     Конвертирует разметку MAX в HTML для Telegram.
-    ГАРАНТИРОВАННЫЙ LIFO порядок закрытия тегов.
+    С автоматической коррекцией смещения offset.
     """
     if not markup or not text:
         return text
@@ -173,14 +170,38 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     start_time = time.time()
     
-    # 1. Сортируем сущности по начальной позиции
-    sorted_markup = sorted(markup, key=lambda m: (m.get('from', 0), m.get('length', 0)))
+    # 1. Корректируем offset для всех сущностей
+    corrected_markup = []
+    for entity in markup:
+        entity = entity.copy()  # Не мутируем оригинал
+        max_offset = entity.get('from', 0)
+        max_length = entity.get('length', 0)
+        etype = entity.get('type', '')
+        
+        # Пытаемся найти реальную позицию по подстроке
+        if max_offset > 0 and max_length > 0 and max_offset + max_length <= len(text):
+            fragment = text[max_offset:max_offset + max_length]
+            
+            if fragment:
+                # Ищем это вхождение в тексте
+                real_offset = text.find(fragment)
+                if real_offset != -1 and real_offset != max_offset:
+                    logger.warning(f"[MARKUP] 🔧 Offset corrected for '{fragment}': MAX={max_offset} -> REAL={real_offset}")
+                    entity['from'] = real_offset
+                # Также проверяем, нет ли другого вхождения раньше
+                elif real_offset == max_offset:
+                    logger.debug(f"[MARKUP] Offset OK for '{fragment}': {max_offset}")
+        
+        corrected_markup.append(entity)
     
-    # 2. Присваиваем каждой сущности уникальный порядковый номер открытия
+    # 2. Сортируем сущности по начальной позиции
+    sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), m.get('length', 0)))
+    
+    # 3. Присваиваем каждой сущности уникальный порядковый номер открытия
     for idx, entity in enumerate(sorted_markup):
         entity['_open_order'] = idx
     
-    # 3. Строим карту тегов
+    # 4. Строим карту тегов
     tag_starts = {}
     tag_ends = {}
     
@@ -218,12 +239,11 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     logger.info(f"[MARKUP] Tag starts at positions: {sorted(tag_starts.keys())}")
     logger.info(f"[MARKUP] Tag ends at positions: {sorted(tag_ends.keys())}")
     
-    # 4. Проходим по тексту
+    # 5. Проходим по тексту
     result = []
-    open_tags = []  # Список (close_tag, open_order)
+    open_tags = []
     
     for i, char in enumerate(text):
-        # Логируем каждые 10 символов для отладки
         if i % 50 == 0 and (i in tag_starts or i in tag_ends):
             logger.debug(f"[MARKUP] Position {i}: char='{char}'")
         
@@ -474,7 +494,7 @@ class TG:
                 txt = await r.text()
                 elapsed = time.time() - start_time
                 logger.info(f"[TG] Status: {r.status} in {elapsed:.2f}s")
-                logger.info(f"[TG-RESP] {txt}")  # ПОЛНЫЙ ОТВЕТ
+                logger.info(f"[TG-RESP] {txt}")
                 
                 resp = json.loads(txt)
                 if r.status == 200 and resp.get('ok'):
@@ -544,7 +564,6 @@ class TG:
                 obj['parse_mode'] = 'HTML'
             input_media.append(obj)
             
-            # Удаляем временное сообщение
             msg_id = upload_resp['result']['message_id']
             await self._request('deleteMessage', json={'chat_id': self.chat_id, 'message_id': msg_id})
             logger.debug(f"[TG]   Uploaded {field}, file_id={file_id}, deleted temp msg {msg_id}")
@@ -765,7 +784,7 @@ async def handle_max_message(msg: Dict):
     logger.info("=" * 80)
 
 # ===================================================================
-# 12. WEBHOOK HANDLER (МАКСИМАЛЬНОЕ ЛОГИРОВАНИЕ)
+# 12. WEBHOOK HANDLER
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
@@ -806,13 +825,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-max-logging'})
+    return web.json_response({'ok': True, 'version': 'final-auto-offset'})
 
 # ===================================================================
 # 13. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL MAX LOGGING]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL AUTO-OFFSET]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
