@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С АВТОКОРРЕКЦИЕЙ OFFSET
-- Автоматический поиск реальной позиции подстроки
-- Гарантированный LIFO порядок закрытия тегов
-- Полное логирование webhook, markup, медиа, Telegram API
+ФИНАЛЬНАЯ ВЕРСИЯ С ИСПРАВЛЕНИЕМ ПОРЯДКА ТЕГОВ
+- Фильтрация вложенных сущностей одного типа
+- Сортировка по убыванию длины (внешние теги раньше)
+- Автокоррекция offset
+- Полное логирование
 - Гибридная отправка медиа
 - Транслитерация имён файлов
 """
@@ -64,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH AUTO-OFFSET]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - CORRECT TAG ORDER]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -81,7 +82,6 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
 # ===================================================================
 def fix_broken_html(text: str) -> str:
     if not text: return text
-    logger.debug(f"[HTML-FIX] Input: {text[:100]}...")
     tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'a', 'tg-spoiler']
     fixed = text
     for tag in tags:
@@ -91,15 +91,12 @@ def fix_broken_html(text: str) -> str:
         close_count = len(re.findall(close_pattern, fixed, re.IGNORECASE))
         if open_count > close_count:
             fixed += f'</{tag}>' * (open_count - close_count)
-            logger.debug(f"[HTML-FIX] Added {open_count - close_count} </{tag}>")
         elif close_count > open_count:
             fixed = re.sub(close_pattern, f'&lt;/{tag}&gt;', fixed, flags=re.IGNORECASE)
-            logger.debug(f"[HTML-FIX] Escaped extra </{tag}>")
     open_a = len(re.findall(r'<a\s+[^>]*>', fixed, re.IGNORECASE))
     close_a = len(re.findall(r'</a>', fixed, re.IGNORECASE))
     if open_a > close_a:
         fixed += '</a>' * (open_a - close_a)
-        logger.debug(f"[HTML-FIX] Added {open_a - close_a} </a>")
     return fixed
 
 def transliterate_ru_to_en(text: str) -> str:
@@ -118,7 +115,6 @@ def transliterate_ru_to_en(text: str) -> str:
     result = ''.join(mapping.get(c, c) for c in text)
     result = re.sub(r'[^a-zA-Z0-9._-]', '_', result)
     result = re.sub(r'_+', '_', result)
-    logger.debug(f"[TRANS] '{text}' -> '{result}'")
     return result.strip('._')
 
 def safe_filename(filename: str) -> str:
@@ -129,7 +125,41 @@ def safe_filename(filename: str) -> str:
     return f"{safe_name}.{ext}" if ext else safe_name
 
 # ===================================================================
-# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (С АВТОКОРРЕКЦИЕЙ OFFSET)
+# 4. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ ОДНОГО ТИПА
+# ===================================================================
+def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
+    """Удаляет вложенные сущности одного типа."""
+    if not markup:
+        return markup
+    
+    filtered = []
+    for i, entity in enumerate(markup):
+        etype = entity.get('type', '')
+        offset = entity.get('from', 0)
+        length = entity.get('length', 0)
+        end = offset + length
+        
+        is_nested = False
+        for j, other in enumerate(markup):
+            if i == j:
+                continue
+            if other.get('type') != etype:
+                continue
+            other_offset = other.get('from', 0)
+            other_end = other_offset + other.get('length', 0)
+            
+            if other_offset <= offset and other_end >= end and (other_offset < offset or other_end > end):
+                is_nested = True
+                logger.warning(f"[MARKUP] 🔄 Ignoring nested {etype}: [{offset}:{end}] inside [{other_offset}:{other_end}]")
+                break
+        
+        if not is_nested:
+            filtered.append(entity)
+    
+    return filtered
+
+# ===================================================================
+# 5. КОНВЕРТАЦИЯ РАЗМЕТКИ (С ПРАВИЛЬНЫМ ПОРЯДКОМ ТЕГОВ)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -149,21 +179,19 @@ def parse_markdown_to_html(text: str) -> str:
     text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
-    logger.debug(f"[MARKDOWN] Result: {text[:200]}...")
     return text
 
 def apply_markup(text: str, markup: List[Dict]) -> str:
-    """
-    Конвертирует разметку MAX в HTML для Telegram.
-    С автоматической коррекцией смещения offset.
-    """
     if not markup or not text:
         return text
+    
+    # Фильтруем вложенные сущности одного типа
+    markup = filter_overlapping_same_type(markup)
     
     logger.info(f"[MARKUP] ========== START CONVERSION ==========")
     logger.info(f"[MARKUP] Text length: {len(text)}")
     logger.info(f"[MARKUP] Text preview: {text[:100]}...")
-    logger.info(f"[MARKUP] Entities count: {len(markup)}")
+    logger.info(f"[MARKUP] Entities count (filtered): {len(markup)}")
     
     if LOG_MARKUP:
         logger.debug(f"[MARKUP] Raw markup: {json.dumps(markup, ensure_ascii=False, indent=2)}")
@@ -173,31 +201,25 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     # 1. Корректируем offset для всех сущностей
     corrected_markup = []
     for entity in markup:
-        entity = entity.copy()  # Не мутируем оригинал
+        entity = entity.copy()
         max_offset = entity.get('from', 0)
         max_length = entity.get('length', 0)
         etype = entity.get('type', '')
         
-        # Пытаемся найти реальную позицию по подстроке
         if max_offset > 0 and max_length > 0 and max_offset + max_length <= len(text):
             fragment = text[max_offset:max_offset + max_length]
-            
             if fragment:
-                # Ищем это вхождение в тексте
                 real_offset = text.find(fragment)
                 if real_offset != -1 and real_offset != max_offset:
                     logger.warning(f"[MARKUP] 🔧 Offset corrected for '{fragment}': MAX={max_offset} -> REAL={real_offset}")
                     entity['from'] = real_offset
-                # Также проверяем, нет ли другого вхождения раньше
-                elif real_offset == max_offset:
-                    logger.debug(f"[MARKUP] Offset OK for '{fragment}': {max_offset}")
         
         corrected_markup.append(entity)
     
-    # 2. Сортируем сущности по начальной позиции
-    sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), m.get('length', 0)))
+    # 2. Сортируем: сначала по offset, потом по убыванию длины (внешние теги раньше)
+    sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), -m.get('length', 0)))
     
-    # 3. Присваиваем каждой сущности уникальный порядковый номер открытия
+    # 3. Присваиваем order
     for idx, entity in enumerate(sorted_markup):
         entity['_open_order'] = idx
     
@@ -247,7 +269,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         if i % 50 == 0 and (i in tag_starts or i in tag_ends):
             logger.debug(f"[MARKUP] Position {i}: char='{char}'")
         
-        # Сначала закрываем теги
+        # Закрываем теги
         if i in tag_ends:
             closing = sorted(tag_ends[i], key=lambda x: -x[1])
             logger.debug(f"[MARKUP] Position {i}: closing {len(closing)} tags (order: {[c[1] for c in closing]})")
@@ -259,7 +281,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                         logger.debug(f"[MARKUP]   Closed {close_tag} (order={open_order})")
                         break
         
-        # Затем открываем новые
+        # Открываем теги
         if i in tag_starts:
             opening = sorted(tag_starts[i], key=lambda x: x[1])
             logger.debug(f"[MARKUP] Position {i}: opening {len(opening)} tags (order: {[o[1] for o in opening]})")
@@ -275,7 +297,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         logger.info(f"[MARKUP] Closing {len(open_tags)} remaining tags")
         for close_tag, open_order in reversed(open_tags):
             result.append(close_tag)
-            logger.debug(f"[MARKUP]   Closed remaining {close_tag} (order={open_order})")
     
     final_text = ''.join(result)
     elapsed = time.time() - start_time
@@ -288,7 +309,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     return final_text
 
 # ===================================================================
-# 5. ИЗВЛЕЧЕНИЕ ДАННЫХ
+# 6. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
 def extract_message_data(msg: Dict) -> Dict:
     logger.info("[EXTRACT] ========== START EXTRACTION ==========")
@@ -322,7 +343,7 @@ def extract_message_data(msg: Dict) -> Dict:
     return result
 
 # ===================================================================
-# 6. АУДИО УТИЛИТЫ
+# 7. АУДИО УТИЛИТЫ
 # ===================================================================
 def get_audio_duration(file_path: str) -> int:
     try:
@@ -346,9 +367,7 @@ def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
             tags = audio.tags
             performer = str(tags.get('TPE1', tags.get('©ART', '')))
             title = str(tags.get('TIT2', tags.get('©nam', '')))
-            logger.debug(f"[AUDIO] Raw tags: performer='{performer}', title='{title}'")
-    except Exception as e:
-        logger.debug(f"[AUDIO] Mutagen error: {e}")
+    except: pass
     
     if not duration: duration = get_audio_duration(tmp_path)
     os.unlink(tmp_path)
@@ -392,7 +411,7 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     return ogg_data
 
 # ===================================================================
-# 7. СКАЧИВАНИЕ ПО URL
+# 8. СКАЧИВАНИЕ ПО URL
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
     if not url: return None
@@ -413,7 +432,7 @@ async def download_from_url(url: str) -> Optional[bytes]:
         return None
 
 # ===================================================================
-# 8. MEDIA PROCESSOR
+# 9. MEDIA PROCESSOR
 # ===================================================================
 class MediaProcessor:
     PHOTO_EXTS = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'heic', 'heif', 'tiff'}
@@ -469,7 +488,7 @@ class MediaProcessor:
         return 'document', meta
 
 # ===================================================================
-# 9. TELEGRAM CLIENT
+# 10. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -612,7 +631,7 @@ class TG:
         return resp and resp.get('ok', False)
 
 # ===================================================================
-# 10. MAX CLIENT
+# 11. MAX CLIENT
 # ===================================================================
 class MX:
     def __init__(self, token: str, cid: str, base: str):
@@ -649,7 +668,7 @@ class MX:
             return False
 
 # ===================================================================
-# 11. ОБРАБОТЧИКИ
+# 12. ОБРАБОТЧИКИ
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -784,7 +803,7 @@ async def handle_max_message(msg: Dict):
     logger.info("=" * 80)
 
 # ===================================================================
-# 12. WEBHOOK HANDLER
+# 13. WEBHOOK HANDLER
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
@@ -825,13 +844,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-auto-offset'})
+    return web.json_response({'ok': True, 'version': 'final-correct-order'})
 
 # ===================================================================
-# 13. ЗАПУСК
+# 14. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL AUTO-OFFSET]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - CORRECT ORDER]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
