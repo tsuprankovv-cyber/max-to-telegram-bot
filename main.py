@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ
-- Исправлена сортировка закрывающих тегов (LIFO)
-- Прямые offset без графем (эмодзи не сбивают)
-- Гибридная отправка медиа
-- Полное логирование запросов и ответов
+ФИНАЛЬНАЯ ВЕРСИЯ - АЛГОРИТМ ИЗ TG → MAX
 """
 import os
 import sys
@@ -25,7 +21,7 @@ from aiohttp import web
 from mutagen import File as MutagenFile
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (МАКСИМАЛЬНОЕ)
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
 # ===================================================================
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 LOG_RAW_MAX = os.getenv('LOG_RAW_MAX', '1') == '1'
@@ -63,12 +59,10 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL FIXED VERSION]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [TG→MAX ALGORITHM]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
-logger.info(f"🔐 Webhook Secret: {'SET' if MAX_WEBHOOK_SECRET else 'NOT SET'}")
-logger.info(f"📊 LOG_LEVEL: {LOG_LEVEL}")
 logger.info("=" * 100)
 
 if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
@@ -123,7 +117,7 @@ def safe_filename(filename: str) -> str:
     return f"{safe_name}.{ext}" if ext else safe_name
 
 # ===================================================================
-# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕННАЯ СОРТИРОВКА)
+# 4. КОНВЕРТАЦИЯ РАЗМЕТКИ (АЛГОРИТМ ИЗ TG → MAX)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -146,84 +140,82 @@ def parse_markdown_to_html(text: str) -> str:
     return text
 
 def apply_markup(text: str, markup: List[Dict]) -> str:
-    if not markup or not text: return text
-    
-    all_from_zero = all(m.get('from', 0) == 0 for m in markup)
-    max_length = max((m.get('length', 0) for m in markup), default=0)
-    if all_from_zero and max_length < len(text):
-        logger.warning("[MARKUP] ⚠️ Broken markup, switching to Markdown.")
-        return parse_markdown_to_html(text)
+    """
+    Конвертирует разметку MAX в HTML для Telegram.
+    Алгоритм взят из aiogram.utils.text_decorations.html_decoration.unparse()
+    """
+    if not markup or not text:
+        return text
     
     logger.info(f"[MARKUP] Converting: text_len={len(text)}, entities={len(markup)}")
     start_time = time.time()
     
-    events = []
-    for idx, entity in enumerate(markup):
-        try:
-            offset = int(entity.get('from', 0))
-            length = int(entity.get('length', 0))
-            etype = entity.get('type', '')
-            if offset < 0 or length <= 0 or offset + length > len(text): continue
-            if etype not in MAX_TAG_MAP: continue
-            
-            tag_name = MAX_TAG_MAP[etype]
-            if etype in ('link', 'text_link', 'url'):
-                url = entity.get('url', '').replace('"', '&quot;')
-                open_tag = f'<{tag_name} href="{url}">' if url else f'<{tag_name}>'
-            else:
-                open_tag = f'<{tag_name}>'
-            close_tag = f'</{tag_name}>'
-            
-            events.append((offset, 'open', open_tag, close_tag, idx))
-            events.append((offset + length, 'close', open_tag, close_tag, idx))
-            logger.debug(f"[MARKUP] {etype}: [{offset}:{offset+length}] -> <{tag_name}>")
-        except Exception as e:
-            logger.error(f"[MARKUP] Error: {e}")
-
-    # Сортируем события: сначала по позиции, закрывающие перед открывающими
-    events.sort(key=lambda x: (x[0], 0 if x[1] == 'close' else 1, -x[4]))
+    # Сортируем сущности по начальной позиции
+    sorted_markup = sorted(markup, key=lambda m: (m.get('from', 0), m.get('length', 0)))
     
+    # Строим карту тегов для каждой позиции
+    tag_starts = {}
+    tag_ends = {}
+    
+    for entity in sorted_markup:
+        offset = entity.get('from', 0)
+        length = entity.get('length', 0)
+        etype = entity.get('type', '')
+        
+        if etype not in MAX_TAG_MAP:
+            continue
+        
+        tag_name = MAX_TAG_MAP[etype]
+        
+        if etype in ('link', 'text_link', 'url'):
+            url = entity.get('url', '').replace('"', '&quot;')
+            open_tag = f'<{tag_name} href="{url}">' if url else f'<{tag_name}>'
+        else:
+            open_tag = f'<{tag_name}>'
+        
+        close_tag = f'</{tag_name}>'
+        
+        if offset not in tag_starts:
+            tag_starts[offset] = []
+        tag_starts[offset].append(open_tag)
+        
+        end_pos = offset + length
+        if end_pos not in tag_ends:
+            tag_ends[end_pos] = []
+        tag_ends[end_pos].append(close_tag)
+        
+        logger.debug(f"[MARKUP] {etype}: [{offset}:{end_pos}] -> <{tag_name}>")
+    
+    # Проходим по тексту и собираем результат
     result = []
-    open_stack = []
-    event_idx = 0
-    n = len(text)
+    open_tags = []
     
-    for pos in range(n + 1):
-        # Собираем все события на текущей позиции
-        pos_events = []
-        while event_idx < len(events) and events[event_idx][0] == pos:
-            pos_events.append(events[event_idx])
-            event_idx += 1
+    for i, char in enumerate(text):
+        # Сначала закрываем теги
+        if i in tag_ends:
+            for close_tag in tag_ends[i]:
+                for j in range(len(open_tags) - 1, -1, -1):
+                    if open_tags[j] == close_tag:
+                        result.append(close_tag)
+                        open_tags.pop(j)
+                        break
         
-        # ВАЖНО: Сортируем события на одной позиции
-        # 1. Сначала ВСЕ закрывающие (в обратном порядке приоритета = LIFO)
-        # 2. Потом ВСЕ открывающие
-        close_events = sorted([e for e in pos_events if e[1] == 'close'], key=lambda x: -x[4])
-        open_events = sorted([e for e in pos_events if e[1] == 'open'], key=lambda x: -x[4])
+        # Затем открываем новые
+        if i in tag_starts:
+            for open_tag in tag_starts[i]:
+                open_tags.append(open_tag)
+                result.append(open_tag)
         
-        # Обрабатываем закрывающие
-        for _, _, _, close_tag, priority in close_events:
-            for i in range(len(open_stack) - 1, -1, -1):
-                if open_stack[i][0] == close_tag and open_stack[i][1] == priority:
-                    result.append(close_tag)
-                    open_stack.pop(i)
-                    break
-        
-        # Обрабатываем открывающие
-        for _, _, open_tag, close_tag, priority in open_events:
-            open_stack.append((close_tag, priority))
-            result.append(open_tag)
-        
-        if pos < n:
-            result.append(text[pos])
+        result.append(char)
     
-    # Закрываем оставшиеся теги
-    for close_tag, _ in reversed(open_stack):
+    # Закрываем оставшиеся
+    for close_tag in reversed(open_tags):
         result.append(close_tag)
     
     final_text = ''.join(result)
     logger.info(f"[MARKUP] ✅ Converted in {time.time() - start_time:.2f}s")
     logger.debug(f"[MARKUP] Preview: {final_text[:200]}...")
+    
     return final_text
 
 # ===================================================================
@@ -395,7 +387,7 @@ class TG:
             async with self.session.post(f"{self.base}/{method}", **kw) as r:
                 txt = await r.text()
                 logger.info(f"[TG] Status: {r.status}")
-                logger.info(f"[TG-RESP] {txt}")  # ПОЛНЫЙ ОТВЕТ
+                logger.info(f"[TG-RESP] {txt}")
                 
                 resp = json.loads(txt)
                 if r.status == 200 and resp.get('ok'):
@@ -635,7 +627,7 @@ async def handle_max_message(msg: Dict):
     logger.info("=" * 80)
 
 # ===================================================================
-# 12. WEBHOOK HANDLER (МАКСИМАЛЬНОЕ ЛОГИРОВАНИЕ)
+# 12. WEBHOOK HANDLER
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
@@ -664,13 +656,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-fixed'})
+    return web.json_response({'ok': True, 'version': 'tg-max-algorithm'})
 
 # ===================================================================
 # 13. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL FIXED]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [TG→MAX ALGORITHM]...")
     if RENDER_EXTERNAL_URL:
         await mx.register_webhook(f"{RENDER_EXTERNAL_URL}/webhook", MAX_WEBHOOK_SECRET)
     
