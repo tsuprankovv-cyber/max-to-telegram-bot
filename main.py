@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С МАКСИМАЛЬНЫМ ЛОГИРОВАНИЕМ
-- Ссылки: голые URL + Markdown
+ФИНАЛЬНАЯ ВЕРСИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ
+- Ссылки: https://, http://, ttps:// (опечатки)
+- type: "share" → документ
+- Правильная передача вложений в other
 - Голосовые: .ogg, .opus, .oga
 - Фото/видео как файл → документ
-- Детальное логирование всех проблемных мест
+- Детальное логирование всех этапов
 """
 import os
 import sys
@@ -63,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH MAX LOGGING]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -209,17 +211,16 @@ def parse_markdown_to_html(text: str) -> str:
     logger.info("[MARKDOWN] ========== PARSING MARKDOWN ==========")
     logger.info(f"[MARKDOWN] Input: {text[:200]}...")
     
-    # Жирный, курсив, подчёркнутый, зачёркнутый
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
     text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
-    
-    # Markdown-ссылки: [текст](url)
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
     
-    # Голые URL — автоматически делаем кликабельными
+    # Голые URL — https:// и http://
     text = re.sub(r'(?<!["\'>])(https?://[^\s<>\[\]()]+)', r'<a href="\1">\1</a>', text)
+    # Опечатки — ttps:// -> https://
+    text = re.sub(r'(?<!["\'>])(ttps?://[^\s<>\[\]()]+)', r'<a href="h\1">\1</a>', text)
     
     logger.info(f"[MARKDOWN] Output: {text[:200]}...")
     logger.info("[MARKDOWN] ========== END PARSING ==========")
@@ -429,6 +430,9 @@ class MediaProcessor:
         if atype in ('image', 'photo'):
             logger.info("[MEDIA] ✅ DETERMINED: photo (explicit type)")
             return 'photo', meta
+        if atype == 'share':      # ← ДОБАВЛЕНО: поддержка type="share"
+            logger.info("[MEDIA] ✅ DETERMINED: document (share)")
+            return 'document', meta
         
         # ТОЛЬКО ГОЛОСОВЫЕ И АУДИО ПО РАСШИРЕНИЮ
         if ext in self.VOICE_EXTS:
@@ -670,7 +674,7 @@ async def handle_max_message(msg: Dict):
     if data['markup']:
         logger.info(f"[HANDLE] Applying MAX markup ({len(data['markup'])} items)")
         text = apply_markup(text, data['markup'])
-    elif text and ('*' in text or '_' in text or '[' in text or 'http' in text):
+    elif text and ('*' in text or '_' in text or '[' in text or 'http' in text or 'ttps' in text):
         logger.info("[HANDLE] 📝 Using Markdown parser...")
         text = parse_markdown_to_html(text)
     
@@ -679,7 +683,11 @@ async def handle_max_message(msg: Dict):
     media_items, other = [], []
     for att in data['attachments']:
         t, m = media_proc.determine(att)
-        (media_items if t in ('photo', 'video') else other).append({'type': t, 'attachment': att, 'meta': m})
+        item = {'type': t, 'attachment': att, 'meta': m}
+        if t in ('photo', 'video'):
+            media_items.append(item)
+        else:
+            other.append(item)
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
@@ -708,8 +716,9 @@ async def handle_max_message(msg: Dict):
     elif text:
         await tg.send_text(text, reply_markup)
 
-    for att in other:
-        await process_attachment(att, "")
+    # ИСПРАВЛЕНО: передаём item['attachment'] вместо item
+    for item in other:
+        await process_attachment(item['attachment'], "")
         await asyncio.sleep(0.5)
 
     elapsed = time.time() - start_time
@@ -751,13 +760,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-max-logging'})
+    return web.json_response({'ok': True, 'version': 'final'})
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL MAX LOGGING]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
