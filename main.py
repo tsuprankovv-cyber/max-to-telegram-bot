@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ
+ФИНАЛЬНАЯ ВЕРСИЯ БЕЗ РАЗДЕЛЕНИЯ ТЕКСТА
 - Исправлено принудительное закрытие HTML-тегов (ошибка 400)
-- Длинный текст разбивается: первая часть в caption, остальные отдельными сообщениями
+- Текст отправляется как есть, целиком (без разбивки)
 - Увеличенный таймаут скачивания (300 секунд)
 - Прогресс скачивания больших файлов
 - Кнопки, коллажи, голосовые, документы, транслитерация
@@ -64,7 +64,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - NO TEXT SPLIT]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -122,49 +122,6 @@ def safe_filename(filename: str) -> str:
     safe_name = transliterate_ru_to_en(name) or 'file'
     if len(safe_name) > 100: safe_name = safe_name[:100]
     return f"{safe_name}.{ext}" if ext else safe_name
-
-
-def split_long_text(text: str, max_len: int = 1000) -> List[str]:
-    """Разбивает длинный текст на части, не разрывая слова и HTML-теги."""
-    if len(text) <= max_len:
-        return [text]
-    
-    parts = []
-    current = ""
-    
-    # Разбиваем по строкам
-    lines = text.split('\n')
-    
-    for line in lines:
-        if len(current) + len(line) + 1 <= max_len:
-            current += line + '\n'
-        else:
-            if current:
-                parts.append(current.rstrip('\n'))
-            current = line + '\n'
-    
-    if current:
-        parts.append(current.rstrip('\n'))
-    
-    # Если какая-то часть всё ещё слишком длинная — разбиваем по пробелам
-    final_parts = []
-    for part in parts:
-        if len(part) <= max_len:
-            final_parts.append(part)
-        else:
-            words = part.split(' ')
-            current = ""
-            for word in words:
-                if len(current) + len(word) + 1 <= max_len:
-                    current += word + ' '
-                else:
-                    final_parts.append(current.strip())
-                    current = word + ' '
-            if current:
-                final_parts.append(current.strip())
-    
-    logger.info(f"[TEXT] Split into {len(final_parts)} parts (max_len={max_len})")
-    return final_parts
 
 
 # ===================================================================
@@ -807,12 +764,8 @@ async def handle_max_message(msg: Dict):
 
     reply_markup = convert_max_buttons(data.get('reply_markup', {}))
 
-    # Разбиваем длинный текст
-    text_parts = split_long_text(text, max_len=1000) if text else []
-
     if media_items:
-        # Первая часть — в caption к медиа
-        caption = text_parts[0] if text_parts else ""
+        caption = text if text else ""
         
         if len(media_items) == 1:
             logger.info("[HANDLE] 📷 Single media, sending directly")
@@ -820,17 +773,8 @@ async def handle_max_message(msg: Dict):
         else:
             logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items")
             await send_media_group(media_items, caption)
-        
-        # Остальные части текста — отдельными сообщениями
-        for part in text_parts[1:]:
-            await tg.send_text(part)
-            await asyncio.sleep(0.3)
-            
-    elif text_parts:
-        # Только текст — отправляем все части
-        for part in text_parts:
-            await tg.send_text(part, reply_markup)
-            await asyncio.sleep(0.3)
+    elif text:
+        await tg.send_text(text, reply_markup)
 
     # Отправляем остальные вложения
     for item in other:
@@ -877,14 +821,14 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final'})
+    return web.json_response({'ok': True, 'version': 'final-no-split'})
 
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - NO TEXT SPLIT]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
