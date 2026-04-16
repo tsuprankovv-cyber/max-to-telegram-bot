@@ -1,18 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ
-- Исправлено закрытие тегов для ссылок (</a> вместо </a href="...">)
-- Улучшено логирование ошибок скачивания (показывает URL)
-- Ссылки: голые URL не обрабатываются (Telegram сам кликает)
-- Markdown-ссылки [текст](url) → <a href="url">текст</a>
-- Видео как медиа (type='video') → видео
-- Видео/фото как файл (type='file') → документ
-- Голосовые: .ogg, .opus, .oga
-- Кнопки-ссылки (если есть в webhook)
-- Коррекция offset через UTF-16
-- Транслитерация имён файлов
-- Полное логирование
+ФИНАЛЬНАЯ ВЕРСИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ ТЕКСТА
+- Логирование длины текста на каждом этапе
+- Увеличенный таймаут скачивания (300 секунд)
+- Прогресс скачивания больших файлов
+- Исправлено закрытие тегов для ссылок
+- Поддержка кнопок, коллажей, голосовых, документов
 """
 import os
 import sys
@@ -32,7 +26,7 @@ from aiohttp import web
 from mutagen import File as MutagenFile
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (МАКСИМАЛЬНОЕ)
 # ===================================================================
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 LOG_RAW_MAX = os.getenv('LOG_RAW_MAX', '1') == '1'
@@ -70,7 +64,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH FULL TEXT LOGGING]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -85,6 +79,7 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
 # ===================================================================
 def fix_broken_html(text: str) -> str:
     if not text: return text
+    logger.debug(f"[HTML-FIX] Input length: {len(text)}")
     tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'a', 'tg-spoiler']
     fixed = text
     for tag in tags:
@@ -100,6 +95,7 @@ def fix_broken_html(text: str) -> str:
     close_a = len(re.findall(r'</a>', fixed, re.IGNORECASE))
     if open_a > close_a:
         fixed += '</a>' * (open_a - close_a)
+    logger.debug(f"[HTML-FIX] Output length: {len(fixed)}")
     return fixed
 
 def transliterate_ru_to_en(text: str) -> str:
@@ -199,7 +195,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     return filtered
 
 # ===================================================================
-# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕНО ЗАКРЫТИЕ ТЕГОВ)
+# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (С ЛОГИРОВАНИЕМ ДЛИНЫ)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -214,7 +210,8 @@ MAX_TAG_MAP = {
 def parse_markdown_to_html(text: str) -> str:
     if not text: return text
     logger.info("[MARKDOWN] ========== PARSING MARKDOWN ==========")
-    logger.info(f"[MARKDOWN] Input: {text[:200]}...")
+    logger.info(f"[MARKDOWN] Input length: {len(text)}")
+    logger.info(f"[MARKDOWN] Input preview: {text[:200]}...")
     
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
@@ -222,7 +219,8 @@ def parse_markdown_to_html(text: str) -> str:
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
     
-    logger.info(f"[MARKDOWN] Output: {text[:200]}...")
+    logger.info(f"[MARKDOWN] Output length: {len(text)}")
+    logger.info(f"[MARKDOWN] Output preview: {text[:200]}...")
     logger.info("[MARKDOWN] ========== END PARSING ==========")
     return text
 
@@ -230,7 +228,8 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text: return text
     
     logger.info("[MARKUP] ========== APPLYING MAX MARKUP ==========")
-    logger.info(f"[MARKUP] Text length: {len(text)}")
+    logger.info(f"[MARKUP] Input text length: {len(text)}")
+    logger.info(f"[MARKUP] Input text preview: {text[:200]}...")
     logger.info(f"[MARKUP] Entities count: {len(markup)}")
     
     markup = filter_overlapping_same_type(markup)
@@ -272,7 +271,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
             for open_tag in reversed(open_tags):
                 if open_tag in tag_ends[i]:
                     open_tags.remove(open_tag)
-                    # ПРАВИЛЬНОЕ ЗАКРЫТИЕ ТЕГА
                     tag_name = open_tag.split()[0].strip('<>')
                     close_tag = f'</{tag_name}>'
                     result.append(close_tag)
@@ -287,7 +285,8 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         result.append(close_tag)
     
     final_text = ''.join(result)
-    logger.info(f"[MARKUP] Preview: {final_text[:200]}...")
+    logger.info(f"[MARKUP] Output text length: {len(final_text)}")
+    logger.info(f"[MARKUP] Output preview: {final_text[:200]}...")
     logger.info("[MARKUP] ========== END MARKUP ==========")
     return final_text
 
@@ -306,6 +305,8 @@ def extract_message_data(msg: Dict) -> Dict:
     
     body = inner.get('body', {})
     text = body.get('text', '') or inner.get('text', '')
+    logger.info(f"[EXTRACT] Raw text length: {len(text)}")
+    
     markup = body.get('markup', []) or inner.get('markup', [])
     attachments = [a for a in (body.get('attachments') or inner.get('attachments') or []) if isinstance(a, dict)]
     reply_markup = inner.get('reply_markup') or msg.get('reply_markup')
@@ -340,9 +341,7 @@ def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
             tags = audio.tags
             performer = str(tags.get('TPE1', tags.get('©ART', '')))
             title = str(tags.get('TIT2', tags.get('©nam', '')))
-            logger.debug(f"[AUDIO] Raw tags: performer='{performer}', title='{title}'")
-    except Exception as e:
-        logger.debug(f"[AUDIO] Mutagen error: {e}")
+    except: pass
     if not duration: duration = get_audio_duration(tmp_path)
     os.unlink(tmp_path)
     base_name = safe_filename(filename).rsplit('.', 1)[0]
@@ -376,25 +375,56 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     return ogg_data
 
 # ===================================================================
-# 10. СКАЧИВАНИЕ ПО URL (С УЛУЧШЕННЫМ ЛОГИРОВАНИЕМ)
+# 10. СКАЧИВАНИЕ ПО URL (С УВЕЛИЧЕННЫМ ТАЙМАУТОМ И ПРОГРЕССОМ)
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
-    if not url: return None
-    logger.info(f"[DOWNLOAD] 📥 Downloading: {url[:100]}...")
+    if not url:
+        logger.error("[DOWNLOAD] ❌ Empty URL")
+        return None
+    
+    logger.info("[DOWNLOAD] ========== START DOWNLOAD ==========")
+    logger.info(f"[DOWNLOAD] 📥 URL: {url[:150]}...")
     start_time = time.time()
+    
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as r:
-                elapsed = time.time() - start_time
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as r:
+                logger.info(f"[DOWNLOAD] HTTP Status: {r.status}")
+                
                 if r.status == 200:
-                    data = await r.read()
-                    logger.info(f"[DOWNLOAD] ✅ {len(data)} bytes in {elapsed:.2f}s")
+                    content_length = r.headers.get('Content-Length')
+                    if content_length:
+                        logger.info(f"[DOWNLOAD] Content-Length: {int(content_length)} bytes ({int(content_length)/1024/1024:.1f} MB)")
+                    
+                    data = b''
+                    chunk_size = 1024 * 1024
+                    downloaded = 0
+                    last_log_time = start_time
+                    
+                    async for chunk in r.content.iter_chunked(chunk_size):
+                        data += chunk
+                        downloaded += len(chunk)
+                        
+                        now = time.time()
+                        if now - last_log_time >= 5:
+                            elapsed = now - start_time
+                            speed = downloaded / elapsed if elapsed > 0 else 0
+                            logger.info(f"[DOWNLOAD] ⏳ Downloaded: {downloaded/1024/1024:.1f} MB | Speed: {speed/1024:.1f} KB/s")
+                            last_log_time = now
+                    
+                    elapsed = time.time() - start_time
+                    logger.info(f"[DOWNLOAD] ✅ Completed: {len(data)/1024/1024:.1f} MB in {elapsed:.2f}s")
+                    logger.info("[DOWNLOAD] ========== END DOWNLOAD ==========")
                     return data
                 else:
-                    logger.error(f"[DOWNLOAD] ❌ HTTP {r.status} for URL: {url[:150]}...")
+                    text = await r.text()
+                    logger.error(f"[DOWNLOAD] ❌ HTTP {r.status}: {text[:200]}")
                     return None
+    except asyncio.TimeoutError:
+        logger.error(f"[DOWNLOAD] ❌ Timeout after 300s")
+        return None
     except Exception as e:
-        logger.error(f"[DOWNLOAD] ❌ URL: {url[:150]}... | Error: {e}")
+        logger.error(f"[DOWNLOAD] ❌ Exception: {e}")
         return None
 
 # ===================================================================
@@ -423,7 +453,6 @@ class MediaProcessor:
         if LOG_MEDIA:
             logger.debug(f"[MEDIA] Full attachment: {json.dumps(att, ensure_ascii=False)[:500]}")
         
-        # ЯВНЫЕ ТИПЫ ОТ MAX — ОТПРАВЛЯЕМ КАК МЕДИА
         if atype == 'voice':
             logger.info("[MEDIA] ✅ DETERMINED: voice (explicit type)")
             return 'voice', meta
@@ -440,7 +469,6 @@ class MediaProcessor:
             logger.info("[MEDIA] ✅ DETERMINED: document (share)")
             return 'document', meta
         
-        # ТОЛЬКО ГОЛОСОВЫЕ И АУДИО ПО РАСШИРЕНИЮ (для type='file')
         if ext in self.VOICE_EXTS:
             logger.info(f"[MEDIA] ✅ DETERMINED: voice (extension .{ext})")
             return 'voice', meta
@@ -448,12 +476,11 @@ class MediaProcessor:
             logger.info(f"[MEDIA] ✅ DETERMINED: audio (extension .{ext})")
             return 'audio', meta
         
-        # ВСЁ ОСТАЛЬНОЕ (включая type='file' с .mp4, .jpg) — ДОКУМЕНТ
         logger.info(f"[MEDIA] 📄 DETERMINED: document (type='{atype}', ext='{ext}')")
         return 'document', meta
 
 # ===================================================================
-# 12. TELEGRAM CLIENT
+# 12. TELEGRAM CLIENT (С ЛОГИРОВАНИЕМ ДЛИНЫ ТЕКСТА)
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -477,13 +504,16 @@ class TG:
                 txt = await r.text()
                 elapsed = time.time() - start_time
                 logger.info(f"[TG] Status: {r.status} in {elapsed:.2f}s")
-                logger.info(f"[TG-RESP] {txt}")
+                logger.info(f"[TG-RESP] {txt[:500]}...")
                 
                 resp = json.loads(txt)
                 if r.status == 200 and resp.get('ok'):
                     result = resp.get('result')
                     if isinstance(result, dict):
                         msg_id = result.get('message_id')
+                        # Логируем длину caption если есть
+                        if 'caption' in result:
+                            logger.info(f"[TG] Caption length in response: {len(result['caption'])}")
                     elif isinstance(result, list):
                         msg_id = [r.get('message_id') for r in result if isinstance(r, dict)]
                     else:
@@ -504,19 +534,19 @@ class TG:
 
     async def send_text(self, text: str, reply_markup: Optional[Dict] = None) -> bool:
         if not text: return True
+        logger.info(f"[TG] 📤 Sending text: length={len(text)}")
         text = fix_broken_html(text)
-        logger.info(f"[TG] 📤 Sending text: {text[:200]}...")
+        logger.info(f"[TG] 📤 After HTML fix: length={len(text)}")
         payload = {'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
         if reply_markup:
             payload['reply_markup'] = reply_markup
-            logger.info(f"[TG] 🎛️ Sending with reply_markup")
         resp = await self._request('sendMessage', json=payload)
         return resp and resp.get('ok', False)
 
     async def send_media_group_via_download(self, items: List[Dict], caption: str = None) -> bool:
         if not items: return True
         if len(items) > 10: items = items[:10]
-        logger.info(f"[TG] 📤 Media group (via download): {len(items)} items")
+        logger.info(f"[TG] 📤 Media group (via download): {len(items)} items, caption length: {len(caption) if caption else 0}")
         
         input_media = []
         for i, item in enumerate(items):
@@ -535,11 +565,11 @@ class TG:
             if i == 0 and caption:
                 obj['caption'] = fix_broken_html(caption)[:1024]
                 obj['parse_mode'] = 'HTML'
+                logger.info(f"[TG] Caption for first media: length={len(obj['caption'])}")
             input_media.append(obj)
             
             msg_id = upload_resp['result']['message_id']
             await self._request('deleteMessage', json={'chat_id': self.chat_id, 'message_id': msg_id})
-            logger.debug(f"[TG]   Uploaded {field}, file_id={file_id}")
         
         resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
         return resp and resp.get('ok', False)
@@ -549,7 +579,7 @@ class TG:
         method = method_map.get(media_type, 'sendDocument')
         field = media_type if media_type != 'document' else 'document'
         
-        logger.info(f"[TG] 📤 Sending {media_type}: is_url={is_url}, size={len(media_data) if isinstance(media_data, bytes) else 'N/A'}")
+        logger.info(f"[TG] 📤 Sending {media_type}: is_url={is_url}, caption length={len(caption)}")
         
         form = aiohttp.FormData()
         form.add_field('chat_id', self.chat_id)
@@ -558,22 +588,19 @@ class TG:
         
         if is_url:
             form.add_field(field, media_data)
-            logger.debug(f"[TG]   URL: {str(media_data)[:80]}...")
         else:
             form.add_field(field, media_data, filename=safe_fname)
-            logger.debug(f"[TG]   File: {safe_fname}")
         
         if caption and media_type != 'document':
             caption = fix_broken_html(caption)
+            logger.info(f"[TG] Caption after HTML fix: length={len(caption)}")
             form.add_field('caption', caption[:1024])
             form.add_field('parse_mode', 'HTML')
-            logger.debug(f"[TG]   Caption: {caption[:100]}...")
         
         if media_type == 'audio':
             if extra.get('performer'): form.add_field('performer', extra['performer'][:64])
             if extra.get('title'): form.add_field('title', extra['title'][:64])
             if extra.get('duration'): form.add_field('duration', str(extra['duration']))
-            logger.debug(f"[TG]   Audio extra: {extra}")
         if media_type == 'voice' and extra.get('duration'):
             form.add_field('duration', str(extra['duration']))
             
@@ -607,7 +634,7 @@ class MX:
             return False
 
 # ===================================================================
-# 14. ОБРАБОТЧИКИ
+# 14. ОБРАБОТЧИКИ (С ЛОГИРОВАНИЕМ ДЛИНЫ ТЕКСТА)
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -616,6 +643,7 @@ media_proc = MediaProcessor()
 async def process_attachment(att: Dict, caption: str = "") -> bool:
     start_time = time.time()
     logger.info("[ATT] ========== PROCESSING ATTACHMENT ==========")
+    logger.info(f"[ATT] Caption length: {len(caption)}")
     
     if not isinstance(att, dict):
         logger.warning("[ATT] ❌ Not a dict, skipping")
@@ -677,14 +705,17 @@ async def handle_max_message(msg: Dict):
         return
 
     text = data['text']
+    logger.info(f"[HANDLE] Raw text length: {len(text)}")
+    
     if data['markup']:
         logger.info(f"[HANDLE] Applying MAX markup ({len(data['markup'])} items)")
         text = apply_markup(text, data['markup'])
-    elif text and ('*' in text or '_' in text or '[' in text or 'http' in text or 'ttps' in text):
+    elif text and ('*' in text or '_' in text or '[' in text or 'http' in text):
         logger.info("[HANDLE] 📝 Using Markdown parser...")
         text = parse_markdown_to_html(text)
     
-    logger.info(f"[HANDLE] Final text: {text[:200]}...")
+    logger.info(f"[HANDLE] Final text length: {len(text)}")
+    logger.info(f"[HANDLE] Final text preview: {text[:200]}...")
 
     media_items, other = [], []
     for att in data['attachments']:
@@ -736,7 +767,6 @@ async def handle_max_message(msg: Dict):
 async def webhook_handler(request):
     logger.info("=" * 60)
     logger.info(f"[WEBHOOK] 📨 {request.method} from {request.remote}")
-    logger.info(f"[WEBHOOK] Headers: {dict(request.headers)}")
     
     if request.method != 'POST':
         logger.warning(f"[WEBHOOK] Invalid method: {request.method}")
@@ -765,13 +795,13 @@ async def webhook_handler(request):
         logger.info("=" * 60)
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final'})
+    return web.json_response({'ok': True, 'version': 'final-text-logging'})
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL TEXT LOGGING]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
