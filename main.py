@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ
-- Исправлен порядок тегов для вложенных сущностей (a → u → b → i)
-- Текст отправляется целиком (без разбивки)
-- Исправлено принудительное закрытие HTML-тегов
+ФИНАЛЬНАЯ ВЕРСИЯ БЕЗ ОБРЕЗКИ CAPTION
+- Убраны принудительные обрезки caption[:1024]
+- Удаление пустых HTML-тегов
+- Полное логирование ответов Telegram (без обрезки)
+- Исправлен порядок тегов для вложенных сущностей
 - Увеличенный таймаут скачивания (300 секунд)
 - Прогресс скачивания больших файлов
 - Кнопки, коллажи, голосовые, документы, транслитерация
@@ -27,7 +28,7 @@ from aiohttp import web
 from mutagen import File as MutagenFile
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (ПОЛНОЕ)
 # ===================================================================
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 LOG_RAW_MAX = os.getenv('LOG_RAW_MAX', '1') == '1'
@@ -37,7 +38,7 @@ LOG_MEDIA = os.getenv('LOG_MEDIA', '1') == '1'
 
 file_handler = RotatingFileHandler(
     'bot_debug.log',
-    maxBytes=10*1024*1024,
+    maxBytes=20*1024*1024,  # 20 MB
     backupCount=5,
     encoding='utf-8'
 )
@@ -65,7 +66,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - FIXED TAG ORDER]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - NO CAPTION LIMIT]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -78,6 +79,18 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
 # ===================================================================
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===================================================================
+def remove_empty_tags(text: str) -> str:
+    """Удаляет пустые HTML-теги, которые ломают Telegram API."""
+    if not text: return text
+    
+    tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a', 'tg-spoiler']
+    for tag in tags:
+        text = re.sub(f'<{tag}></{tag}>', '', text)
+        text = re.sub(f'<{tag} [^>]*></{tag}>', '', text)
+    
+    return text
+
+
 def fix_broken_html(text: str) -> str:
     """Принудительно закрывает все незакрытые HTML-теги."""
     if not text: return text
@@ -93,6 +106,7 @@ def fix_broken_html(text: str) -> str:
             text += f'</{tag}>' * (open_count - close_count)
             logger.warning(f"[HTML-FIX] Added {open_count - close_count} </{tag}>")
     
+    text = remove_empty_tags(text)
     logger.debug(f"[HTML-FIX] Output length: {len(text)}")
     return text
 
@@ -199,7 +213,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
 
 
 # ===================================================================
-# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕН ПОРЯДОК ТЕГОВ)
+# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -211,7 +225,6 @@ MAX_TAG_MAP = {
     "link": "a", "text_link": "a", "url": "a",
 }
 
-# Порядок тегов для вложенных сущностей (от внешнего к внутреннему)
 TAG_ORDER = {'a': 1, 'u': 2, 's': 3, 'b': 4, 'i': 5, 'code': 6, 'pre': 7, 'tg-spoiler': 8}
 
 
@@ -281,7 +294,6 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                     close_tag = f'</{tag_name}>'
                     result.append(close_tag)
         if i in tag_starts:
-            # СОРТИРУЕМ ТЕГИ ПО ПОРЯДКУ ВЛОЖЕННОСТИ
             sorted_tags = sorted(tag_starts[i], key=lambda t: TAG_ORDER.get(t.split()[0].strip('<>'), 99))
             for open_tag in sorted_tags:
                 open_tags.append(open_tag)
@@ -294,7 +306,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     
     final_text = ''.join(result)
     logger.info(f"[MARKUP] Output text length: {len(final_text)}")
-    logger.info(f"[MARKUP] Output preview: {final_text[:200]}...")
+    logger.info(f"[MARKUP] Output preview: {final_text[:300]}...")
     logger.info("[MARKUP] ========== END MARKUP ==========")
     return final_text
 
@@ -495,7 +507,7 @@ class MediaProcessor:
 
 
 # ===================================================================
-# 12. TELEGRAM CLIENT
+# 12. TELEGRAM CLIENT (БЕЗ ОБРЕЗКИ CAPTION)
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -511,7 +523,7 @@ class TG:
         await self.init()
         logger.info(f"[TG] ▶️ {method}")
         if LOG_RAW_TG:
-            logger.debug(f"[TG-REQ] {json.dumps(kw, default=str, ensure_ascii=False)[:500]}")
+            logger.debug(f"[TG-REQ] {json.dumps(kw, default=str, ensure_ascii=False)[:1000]}")
         
         start_time = time.time()
         try:
@@ -519,7 +531,7 @@ class TG:
                 txt = await r.text()
                 elapsed = time.time() - start_time
                 logger.info(f"[TG] Status: {r.status} in {elapsed:.2f}s")
-                logger.info(f"[TG-RESP] {txt[:500]}...")
+                logger.info(f"[TG-RESP] {txt}")  # ПОЛНЫЙ ОТВЕТ
                 
                 resp = json.loads(txt)
                 if r.status == 200 and resp.get('ok'):
@@ -528,6 +540,8 @@ class TG:
                         msg_id = result.get('message_id')
                         if 'caption' in result:
                             logger.info(f"[TG] Caption length in response: {len(result['caption'])}")
+                        if 'text' in result:
+                            logger.info(f"[TG] Text length in response: {len(result['text'])}")
                     elif isinstance(result, list):
                         msg_id = [r.get('message_id') for r in result if isinstance(r, dict)]
                     else:
@@ -577,7 +591,8 @@ class TG:
             file_id = upload_resp['result'][field][0]['file_id'] if field == 'photo' else upload_resp['result']['video']['file_id']
             obj = {'type': item['type'], 'media': file_id}
             if i == 0 and caption:
-                obj['caption'] = fix_broken_html(caption)[:1024]
+                caption = fix_broken_html(caption)
+                obj['caption'] = caption  # БЕЗ ОБРЕЗКИ
                 obj['parse_mode'] = 'HTML'
                 logger.info(f"[TG] Caption for first media: length={len(obj['caption'])}")
             input_media.append(obj)
@@ -608,7 +623,7 @@ class TG:
         if caption and media_type != 'document':
             caption = fix_broken_html(caption)
             logger.info(f"[TG] Caption after HTML fix: length={len(caption)}")
-            form.add_field('caption', caption[:1024])
+            form.add_field('caption', caption)  # БЕЗ ОБРЕЗКИ
             form.add_field('parse_mode', 'HTML')
         
         if media_type == 'audio':
@@ -754,7 +769,7 @@ async def handle_max_message(msg: Dict):
         text = parse_markdown_to_html(text)
     
     logger.info(f"[HANDLE] Final text length: {len(text)}")
-    logger.info(f"[HANDLE] Final text preview: {text[:200]}...")
+    logger.info(f"[HANDLE] Final text preview: {text[:300]}...")
 
     media_items, other = [], []
     for att in data['attachments']:
@@ -825,14 +840,14 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-tag-order'})
+    return web.json_response({'ok': True, 'version': 'final-no-caption-limit'})
 
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - FIXED TAG ORDER]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - NO CAPTION LIMIT]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
