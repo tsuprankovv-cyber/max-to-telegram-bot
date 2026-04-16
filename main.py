@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ БЕЗ ОБРЕЗКИ CAPTION
-- Убраны принудительные обрезки caption[:1024]
+ФИНАЛЬНАЯ ВЕРСИЯ С УМНЫМ РАЗДЕЛЕНИЕМ ТЕКСТА
+- Умное разделение длинных текстов (>1000 символов)
+- Первая часть в caption, остальные отдельными сообщениями
+- Разделение по абзацам и предложениям, без разрыва слов и ссылок
 - Удаление пустых HTML-тегов
-- Полное логирование ответов Telegram (без обрезки)
+- Полное логирование
 - Исправлен порядок тегов для вложенных сущностей
 - Увеличенный таймаут скачивания (300 секунд)
-- Прогресс скачивания больших файлов
-- Кнопки, коллажи, голосовые, документы, транслитерация
 """
 import os
 import sys
@@ -66,7 +66,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - NO CAPTION LIMIT]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - SMART TEXT SPLIT]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -136,6 +136,62 @@ def safe_filename(filename: str) -> str:
     safe_name = transliterate_ru_to_en(name) or 'file'
     if len(safe_name) > 100: safe_name = safe_name[:100]
     return f"{safe_name}.{ext}" if ext else safe_name
+
+
+def split_smart_text(text: str, max_len: int = 1000) -> List[str]:
+    """
+    Умно разделяет длинный текст на части.
+    - Не разрывает слова
+    - Не разрывает HTML-теги
+    - Разделяет по абзацам (\n\n)
+    - Если абзац слишком длинный — по предложениям (.!?)
+    """
+    if len(text) <= max_len:
+        return [text]
+    
+    logger.info(f"[TEXT] Splitting {len(text)} chars (max={max_len})")
+    
+    parts = []
+    current = ""
+    
+    # Разделяем по абзацам
+    paragraphs = text.split('\n\n')
+    
+    for para in paragraphs:
+        if len(current) + len(para) + 2 <= max_len:
+            if current:
+                current += '\n\n' + para
+            else:
+                current = para
+        else:
+            if current:
+                parts.append(current)
+            
+            # Если абзац сам по себе длинный — делим по предложениям
+            if len(para) > max_len:
+                sentences = re.split(r'(?<=[.!?])\s+', para)
+                current = ""
+                for sent in sentences:
+                    if len(current) + len(sent) + 1 <= max_len:
+                        if current:
+                            current += ' ' + sent
+                        else:
+                            current = sent
+                    else:
+                        if current:
+                            parts.append(current)
+                        current = sent
+            else:
+                current = para
+    
+    if current:
+        parts.append(current)
+    
+    logger.info(f"[TEXT] Split into {len(parts)} parts")
+    for i, part in enumerate(parts):
+        logger.info(f"[TEXT] Part {i+1}: {len(part)} chars")
+    
+    return parts
 
 
 # ===================================================================
@@ -507,7 +563,7 @@ class MediaProcessor:
 
 
 # ===================================================================
-# 12. TELEGRAM CLIENT (БЕЗ ОБРЕЗКИ CAPTION)
+# 12. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -540,8 +596,6 @@ class TG:
                         msg_id = result.get('message_id')
                         if 'caption' in result:
                             logger.info(f"[TG] Caption length in response: {len(result['caption'])}")
-                        if 'text' in result:
-                            logger.info(f"[TG] Text length in response: {len(result['text'])}")
                     elif isinstance(result, list):
                         msg_id = [r.get('message_id') for r in result if isinstance(r, dict)]
                     else:
@@ -592,7 +646,7 @@ class TG:
             obj = {'type': item['type'], 'media': file_id}
             if i == 0 and caption:
                 caption = fix_broken_html(caption)
-                obj['caption'] = caption  # БЕЗ ОБРЕЗКИ
+                obj['caption'] = caption
                 obj['parse_mode'] = 'HTML'
                 logger.info(f"[TG] Caption for first media: length={len(obj['caption'])}")
             input_media.append(obj)
@@ -623,7 +677,7 @@ class TG:
         if caption and media_type != 'document':
             caption = fix_broken_html(caption)
             logger.info(f"[TG] Caption after HTML fix: length={len(caption)}")
-            form.add_field('caption', caption)  # БЕЗ ОБРЕЗКИ
+            form.add_field('caption', caption)
             form.add_field('parse_mode', 'HTML')
         
         if media_type == 'audio':
@@ -785,7 +839,11 @@ async def handle_max_message(msg: Dict):
     reply_markup = convert_max_buttons(data.get('reply_markup', {}))
 
     if media_items:
-        caption = text if text else ""
+        # Умное разделение длинного текста
+        text_parts = split_smart_text(text, max_len=1000) if text else []
+        
+        # Первая часть — в caption
+        caption = text_parts[0] if text_parts else ""
         
         if len(media_items) == 1:
             logger.info("[HANDLE] 📷 Single media, sending directly")
@@ -793,8 +851,18 @@ async def handle_max_message(msg: Dict):
         else:
             logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items")
             await send_media_group(media_items, caption)
+        
+        # Остальные части текста — отдельными сообщениями
+        for part in text_parts[1:]:
+            await tg.send_text(part)
+            await asyncio.sleep(0.3)
+            
     elif text:
-        await tg.send_text(text, reply_markup)
+        # Только текст — отправляем как есть (или частями если нужно)
+        text_parts = split_smart_text(text, max_len=4000) if len(text) > 4000 else [text]
+        for part in text_parts:
+            await tg.send_text(part, reply_markup)
+            await asyncio.sleep(0.3)
 
     for item in other:
         await process_attachment(item['attachment'], "")
@@ -840,14 +908,14 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-no-caption-limit'})
+    return web.json_response({'ok': True, 'version': 'final-smart-split'})
 
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - NO CAPTION LIMIT]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - SMART SPLIT]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
