@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ ТЕКСТА
-- Логирование длины текста на каждом этапе
+ФИНАЛЬНАЯ ВЕРСИЯ
+- Исправлено принудительное закрытие HTML-тегов (ошибка 400)
+- Длинный текст разбивается: первая часть в caption, остальные отдельными сообщениями
 - Увеличенный таймаут скачивания (300 секунд)
 - Прогресс скачивания больших файлов
-- Исправлено закрытие тегов для ссылок
-- Поддержка кнопок, коллажей, голосовых, документов
+- Кнопки, коллажи, голосовые, документы, транслитерация
 """
 import os
 import sys
@@ -26,7 +26,7 @@ from aiohttp import web
 from mutagen import File as MutagenFile
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (МАКСИМАЛЬНОЕ)
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
 # ===================================================================
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 LOG_RAW_MAX = os.getenv('LOG_RAW_MAX', '1') == '1'
@@ -64,7 +64,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL WITH FULL TEXT LOGGING]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -78,25 +78,24 @@ if not all([TG_TOKEN, TG_CHAT, MAX_TOKEN, MAX_CHAN]):
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ===================================================================
 def fix_broken_html(text: str) -> str:
+    """Принудительно закрывает все незакрытые HTML-теги."""
     if not text: return text
     logger.debug(f"[HTML-FIX] Input length: {len(text)}")
-    tags = ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'a', 'tg-spoiler']
-    fixed = text
+    
+    tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a', 'tg-spoiler']
+    
     for tag in tags:
-        open_pattern = f'<{tag}[^>]*>'
-        close_pattern = f'</{tag}>'
-        open_count = len(re.findall(open_pattern, fixed, re.IGNORECASE))
-        close_count = len(re.findall(close_pattern, fixed, re.IGNORECASE))
+        # Считаем открывающие теги (с атрибутами и без)
+        open_count = text.count(f'<{tag}>') + len(re.findall(f'<{tag} [^>]*>', text))
+        close_count = text.count(f'</{tag}>')
+        
         if open_count > close_count:
-            fixed += f'</{tag}>' * (open_count - close_count)
-        elif close_count > open_count:
-            fixed = re.sub(close_pattern, f'&lt;/{tag}&gt;', fixed, flags=re.IGNORECASE)
-    open_a = len(re.findall(r'<a\s+[^>]*>', fixed, re.IGNORECASE))
-    close_a = len(re.findall(r'</a>', fixed, re.IGNORECASE))
-    if open_a > close_a:
-        fixed += '</a>' * (open_a - close_a)
-    logger.debug(f"[HTML-FIX] Output length: {len(fixed)}")
-    return fixed
+            text += f'</{tag}>' * (open_count - close_count)
+            logger.warning(f"[HTML-FIX] Added {open_count - close_count} </{tag}>")
+    
+    logger.debug(f"[HTML-FIX] Output length: {len(text)}")
+    return text
+
 
 def transliterate_ru_to_en(text: str) -> str:
     mapping = {
@@ -116,12 +115,57 @@ def transliterate_ru_to_en(text: str) -> str:
     result = re.sub(r'_+', '_', result)
     return result.strip('._')
 
+
 def safe_filename(filename: str) -> str:
     if not filename: return 'file'
     name, ext = (filename.rsplit('.', 1) + [''])[:2]
     safe_name = transliterate_ru_to_en(name) or 'file'
     if len(safe_name) > 100: safe_name = safe_name[:100]
     return f"{safe_name}.{ext}" if ext else safe_name
+
+
+def split_long_text(text: str, max_len: int = 1000) -> List[str]:
+    """Разбивает длинный текст на части, не разрывая слова и HTML-теги."""
+    if len(text) <= max_len:
+        return [text]
+    
+    parts = []
+    current = ""
+    
+    # Разбиваем по строкам
+    lines = text.split('\n')
+    
+    for line in lines:
+        if len(current) + len(line) + 1 <= max_len:
+            current += line + '\n'
+        else:
+            if current:
+                parts.append(current.rstrip('\n'))
+            current = line + '\n'
+    
+    if current:
+        parts.append(current.rstrip('\n'))
+    
+    # Если какая-то часть всё ещё слишком длинная — разбиваем по пробелам
+    final_parts = []
+    for part in parts:
+        if len(part) <= max_len:
+            final_parts.append(part)
+        else:
+            words = part.split(' ')
+            current = ""
+            for word in words:
+                if len(current) + len(word) + 1 <= max_len:
+                    current += word + ' '
+                else:
+                    final_parts.append(current.strip())
+                    current = word + ' '
+            if current:
+                final_parts.append(current.strip())
+    
+    logger.info(f"[TEXT] Split into {len(final_parts)} parts (max_len={max_len})")
+    return final_parts
+
 
 # ===================================================================
 # 4. КОНВЕРТАЦИЯ КНОПОК MAX → TELEGRAM
@@ -140,6 +184,7 @@ def convert_max_buttons(reply_markup: Dict) -> Optional[Dict]:
             telegram_keyboard.append(telegram_row)
     logger.info(f"[BUTTONS] ✅ Converted {len(telegram_keyboard)} rows")
     return {'inline_keyboard': telegram_keyboard} if telegram_keyboard else None
+
 
 # ===================================================================
 # 5. УНИВЕРСАЛЬНАЯ КОРРЕКЦИЯ OFFSET ЧЕРЕЗ UTF-16
@@ -169,6 +214,7 @@ def normalize_max_offset(text: str, max_offset: int, max_length: int = None) -> 
         return python_offset, python_length
     return python_offset, max_length
 
+
 # ===================================================================
 # 6. ФИЛЬТРАЦИЯ ВЛОЖЕННЫХ СУЩНОСТЕЙ
 # ===================================================================
@@ -194,8 +240,9 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
             filtered.append(entity)
     return filtered
 
+
 # ===================================================================
-# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (С ЛОГИРОВАНИЕМ ДЛИНЫ)
+# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -207,11 +254,11 @@ MAX_TAG_MAP = {
     "link": "a", "text_link": "a", "url": "a",
 }
 
+
 def parse_markdown_to_html(text: str) -> str:
     if not text: return text
     logger.info("[MARKDOWN] ========== PARSING MARKDOWN ==========")
     logger.info(f"[MARKDOWN] Input length: {len(text)}")
-    logger.info(f"[MARKDOWN] Input preview: {text[:200]}...")
     
     text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
     text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
@@ -220,16 +267,15 @@ def parse_markdown_to_html(text: str) -> str:
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
     
     logger.info(f"[MARKDOWN] Output length: {len(text)}")
-    logger.info(f"[MARKDOWN] Output preview: {text[:200]}...")
     logger.info("[MARKDOWN] ========== END PARSING ==========")
     return text
+
 
 def apply_markup(text: str, markup: List[Dict]) -> str:
     if not markup or not text: return text
     
     logger.info("[MARKUP] ========== APPLYING MAX MARKUP ==========")
     logger.info(f"[MARKUP] Input text length: {len(text)}")
-    logger.info(f"[MARKUP] Input text preview: {text[:200]}...")
     logger.info(f"[MARKUP] Entities count: {len(markup)}")
     
     markup = filter_overlapping_same_type(markup)
@@ -290,6 +336,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
     logger.info("[MARKUP] ========== END MARKUP ==========")
     return final_text
 
+
 # ===================================================================
 # 8. ИЗВЛЕЧЕНИЕ ДАННЫХ
 # ===================================================================
@@ -317,6 +364,7 @@ def extract_message_data(msg: Dict) -> Dict:
     
     return {"mid": body.get('mid', ''), "text": text, "markup": markup, "attachments": attachments, "is_forward": is_forward, "reply_markup": reply_markup}
 
+
 # ===================================================================
 # 9. АУДИО УТИЛИТЫ
 # ===================================================================
@@ -327,6 +375,7 @@ def get_audio_duration(file_path: str) -> int:
         if result.returncode == 0: return int(float(result.stdout.strip()))
     except: pass
     return 0
+
 
 def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
     logger.info(f"[AUDIO] Extracting tags from: {filename}")
@@ -352,6 +401,7 @@ def extract_audio_tags(file_data: bytes, filename: str) -> Dict[str, Any]:
     logger.info(f"[AUDIO] Final: performer='{final_performer}', title='{final_title}', duration={duration}s")
     return {'performer': final_performer[:64], 'title': final_title[:64], 'duration': duration}
 
+
 def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     logger.info("[VOICE] 🎤 Converting audio to voice...")
     try:
@@ -374,8 +424,9 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     logger.info(f"[VOICE] ✅ Converted: {len(file_data)} -> {len(ogg_data)} bytes")
     return ogg_data
 
+
 # ===================================================================
-# 10. СКАЧИВАНИЕ ПО URL (С УВЕЛИЧЕННЫМ ТАЙМАУТОМ И ПРОГРЕССОМ)
+# 10. СКАЧИВАНИЕ ПО URL
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
     if not url:
@@ -426,6 +477,7 @@ async def download_from_url(url: str) -> Optional[bytes]:
     except Exception as e:
         logger.error(f"[DOWNLOAD] ❌ Exception: {e}")
         return None
+
 
 # ===================================================================
 # 11. MEDIA PROCESSOR
@@ -479,8 +531,9 @@ class MediaProcessor:
         logger.info(f"[MEDIA] 📄 DETERMINED: document (type='{atype}', ext='{ext}')")
         return 'document', meta
 
+
 # ===================================================================
-# 12. TELEGRAM CLIENT (С ЛОГИРОВАНИЕМ ДЛИНЫ ТЕКСТА)
+# 12. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -511,7 +564,6 @@ class TG:
                     result = resp.get('result')
                     if isinstance(result, dict):
                         msg_id = result.get('message_id')
-                        # Логируем длину caption если есть
                         if 'caption' in result:
                             logger.info(f"[TG] Caption length in response: {len(result['caption'])}")
                     elif isinstance(result, list):
@@ -607,6 +659,7 @@ class TG:
         resp = await self._request(method, data=form)
         return resp and resp.get('ok', False)
 
+
 # ===================================================================
 # 13. MAX CLIENT
 # ===================================================================
@@ -633,12 +686,14 @@ class MX:
             logger.error(f"[MAX] ❌ {e}")
             return False
 
+
 # ===================================================================
-# 14. ОБРАБОТЧИКИ (С ЛОГИРОВАНИЕМ ДЛИНЫ ТЕКСТА)
+# 14. ОБРАБОТЧИКИ
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 media_proc = MediaProcessor()
+
 
 async def process_attachment(att: Dict, caption: str = "") -> bool:
     start_time = time.time()
@@ -690,6 +745,28 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     logger.info(f"[ATT] {'✅' if res else '❌'} Completed in {elapsed:.2f}s")
     return res
 
+
+async def send_media_group(media_items: List[Dict], caption: str = "") -> bool:
+    """Отправляет коллаж с подписью."""
+    downloaded = []
+    for item in media_items:
+        url = item['meta'].get('url')
+        if not url: continue
+        data = await download_from_url(url)
+        if data:
+            downloaded.append({'type': item['type'], 'data': data, 'filename': safe_filename(item['meta'].get('filename', ''))})
+    
+    if downloaded:
+        ok = await tg.send_media_group_via_download(downloaded, caption)
+        if not ok:
+            logger.warning("[HANDLE] Media group failed, sending individually")
+            for i, item in enumerate(downloaded):
+                await tg.send_media(item['type'], item['data'], caption=caption if i == 0 else "", filename=item['filename'])
+                await asyncio.sleep(0.3)
+        return ok
+    return False
+
+
 async def handle_max_message(msg: Dict):
     start_time = time.time()
     logger.info("=" * 80)
@@ -730,29 +807,32 @@ async def handle_max_message(msg: Dict):
 
     reply_markup = convert_max_buttons(data.get('reply_markup', {}))
 
+    # Разбиваем длинный текст
+    text_parts = split_long_text(text, max_len=1000) if text else []
+
     if media_items:
+        # Первая часть — в caption к медиа
+        caption = text_parts[0] if text_parts else ""
+        
         if len(media_items) == 1:
             logger.info("[HANDLE] 📷 Single media, sending directly")
-            await process_attachment(media_items[0]['attachment'], text)
+            await process_attachment(media_items[0]['attachment'], caption)
         else:
-            logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items - using reliable download scheme")
-            downloaded = []
-            for item in media_items:
-                url = item['meta'].get('url')
-                if not url: continue
-                data = await download_from_url(url)
-                if data:
-                    downloaded.append({'type': item['type'], 'data': data, 'filename': safe_filename(item['meta'].get('filename', ''))})
-            if downloaded:
-                ok = await tg.send_media_group_via_download(downloaded, text)
-                if not ok:
-                    logger.warning("[HANDLE] Media group failed, sending individually")
-                    for i, item in enumerate(downloaded):
-                        await tg.send_media(item['type'], item['data'], caption=text if i==0 else "", filename=item['filename'])
-                        await asyncio.sleep(0.3)
-    elif text:
-        await tg.send_text(text, reply_markup)
+            logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items")
+            await send_media_group(media_items, caption)
+        
+        # Остальные части текста — отдельными сообщениями
+        for part in text_parts[1:]:
+            await tg.send_text(part)
+            await asyncio.sleep(0.3)
+            
+    elif text_parts:
+        # Только текст — отправляем все части
+        for part in text_parts:
+            await tg.send_text(part, reply_markup)
+            await asyncio.sleep(0.3)
 
+    # Отправляем остальные вложения
     for item in other:
         await process_attachment(item['attachment'], "")
         await asyncio.sleep(0.5)
@@ -760,6 +840,7 @@ async def handle_max_message(msg: Dict):
     elapsed = time.time() - start_time
     logger.info(f"[HANDLE] ✅ Complete in {elapsed:.2f}s")
     logger.info("=" * 80)
+
 
 # ===================================================================
 # 15. WEBHOOK HANDLER
@@ -794,14 +875,16 @@ async def webhook_handler(request):
     finally:
         logger.info("=" * 60)
 
+
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-text-logging'})
+    return web.json_response({'ok': True, 'version': 'final'})
+
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL TEXT LOGGING]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
@@ -825,6 +908,7 @@ async def main():
     logger.info("✅ Ready to receive messages from MAX!")
     
     await asyncio.Event().wait()
+
 
 if __name__ == '__main__':
     try:
