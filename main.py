@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С ПОЛНЫМ ЛОГИРОВАНИЕМ
-- Ссылки: https://, http://, ttps:// (опечатки)
-- type: "share" → документ
-- Правильная передача вложений в other
+ФИНАЛЬНАЯ ВЕРСИЯ
+- Ссылки: голые URL не обрабатываются (Telegram сам кликает)
+- Markdown-ссылки [текст](url) → <a href="url">текст</a>
+- Видео как медиа (type='video') → видео
+- Видео/фото как файл (type='file') → документ
 - Голосовые: .ogg, .opus, .oga
-- Фото/видео как файл → документ
-- Детальное логирование всех этапов
+- Кнопки-ссылки (если есть в webhook)
+- Коррекция offset через UTF-16
+- Транслитерация имён файлов
+- Полное логирование
 """
 import os
 import sys
@@ -27,7 +30,7 @@ from aiohttp import web
 from mutagen import File as MutagenFile
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (МАКСИМАЛЬНОЕ)
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
 # ===================================================================
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 LOG_RAW_MAX = os.getenv('LOG_RAW_MAX', '1') == '1'
@@ -194,7 +197,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     return filtered
 
 # ===================================================================
-# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ)
+# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -217,10 +220,7 @@ def parse_markdown_to_html(text: str) -> str:
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
     
-    # Голые URL — https:// и http://
-    text = re.sub(r'(?<!["\'>])(https?://[^\s<>\[\]()]+)', r'<a href="\1">\1</a>', text)
-    # Опечатки — ttps:// -> https://
-    text = re.sub(r'(?<!["\'>])(ttps?://[^\s<>\[\]()]+)', r'<a href="h\1">\1</a>', text)
+    # Голые URL не трогаем — Telegram сам делает их кликабельными!
     
     logger.info(f"[MARKDOWN] Output: {text[:200]}...")
     logger.info("[MARKDOWN] ========== END PARSING ==========")
@@ -392,7 +392,7 @@ async def download_from_url(url: str) -> Optional[bytes]:
         return None
 
 # ===================================================================
-# 11. MEDIA PROCESSOR (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ)
+# 11. MEDIA PROCESSOR
 # ===================================================================
 class MediaProcessor:
     VOICE_EXTS = {'ogg', 'opus', 'oga'}
@@ -417,7 +417,7 @@ class MediaProcessor:
         if LOG_MEDIA:
             logger.debug(f"[MEDIA] Full attachment: {json.dumps(att, ensure_ascii=False)[:500]}")
         
-        # ЯВНЫЕ ТИПЫ ОТ MAX
+        # ЯВНЫЕ ТИПЫ ОТ MAX — ОТПРАВЛЯЕМ КАК МЕДИА
         if atype == 'voice':
             logger.info("[MEDIA] ✅ DETERMINED: voice (explicit type)")
             return 'voice', meta
@@ -430,11 +430,11 @@ class MediaProcessor:
         if atype in ('image', 'photo'):
             logger.info("[MEDIA] ✅ DETERMINED: photo (explicit type)")
             return 'photo', meta
-        if atype == 'share':      # ← ДОБАВЛЕНО: поддержка type="share"
+        if atype == 'share':
             logger.info("[MEDIA] ✅ DETERMINED: document (share)")
             return 'document', meta
         
-        # ТОЛЬКО ГОЛОСОВЫЕ И АУДИО ПО РАСШИРЕНИЮ
+        # ТОЛЬКО ГОЛОСОВЫЕ И АУДИО ПО РАСШИРЕНИЮ (для type='file')
         if ext in self.VOICE_EXTS:
             logger.info(f"[MEDIA] ✅ DETERMINED: voice (extension .{ext})")
             return 'voice', meta
@@ -442,12 +442,12 @@ class MediaProcessor:
             logger.info(f"[MEDIA] ✅ DETERMINED: audio (extension .{ext})")
             return 'audio', meta
         
-        # ВСЁ ОСТАЛЬНОЕ (включая фото/видео как файл) — ДОКУМЕНТ
+        # ВСЁ ОСТАЛЬНОЕ (включая type='file' с .mp4, .jpg) — ДОКУМЕНТ
         logger.info(f"[MEDIA] 📄 DETERMINED: document (type='{atype}', ext='{ext}')")
         return 'document', meta
 
 # ===================================================================
-# 12. TELEGRAM CLIENT (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ)
+# 12. TELEGRAM CLIENT
 # ===================================================================
 class TG:
     def __init__(self, token: str, chat_id: str):
@@ -601,7 +601,7 @@ class MX:
             return False
 
 # ===================================================================
-# 14. ОБРАБОТЧИКИ (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ)
+# 14. ОБРАБОТЧИКИ
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -716,7 +716,6 @@ async def handle_max_message(msg: Dict):
     elif text:
         await tg.send_text(text, reply_markup)
 
-    # ИСПРАВЛЕНО: передаём item['attachment'] вместо item
     for item in other:
         await process_attachment(item['attachment'], "")
         await asyncio.sleep(0.5)
@@ -726,7 +725,7 @@ async def handle_max_message(msg: Dict):
     logger.info("=" * 80)
 
 # ===================================================================
-# 15. WEBHOOK HANDLER (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ)
+# 15. WEBHOOK HANDLER
 # ===================================================================
 async def webhook_handler(request):
     logger.info("=" * 60)
