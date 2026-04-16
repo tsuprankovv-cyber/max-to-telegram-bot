@@ -2,6 +2,8 @@
 """
 MAX → Telegram Forwarder
 ФИНАЛЬНАЯ ВЕРСИЯ
+- Исправлено закрытие тегов для ссылок (</a> вместо </a href="...">)
+- Улучшено логирование ошибок скачивания (показывает URL)
 - Ссылки: голые URL не обрабатываются (Telegram сам кликает)
 - Markdown-ссылки [текст](url) → <a href="url">текст</a>
 - Видео как медиа (type='video') → видео
@@ -197,7 +199,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
     return filtered
 
 # ===================================================================
-# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ
+# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕНО ЗАКРЫТИЕ ТЕГОВ)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -219,8 +221,6 @@ def parse_markdown_to_html(text: str) -> str:
     text = re.sub(r'\+\+(.+?)\+\+', r'<u>\1</u>', text)
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
-    
-    # Голые URL не трогаем — Telegram сам делает их кликабельными!
     
     logger.info(f"[MARKDOWN] Output: {text[:200]}...")
     logger.info("[MARKDOWN] ========== END PARSING ==========")
@@ -272,14 +272,19 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
             for open_tag in reversed(open_tags):
                 if open_tag in tag_ends[i]:
                     open_tags.remove(open_tag)
-                    result.append(open_tag.replace('<', '</'))
+                    # ПРАВИЛЬНОЕ ЗАКРЫТИЕ ТЕГА
+                    tag_name = open_tag.split()[0].strip('<>')
+                    close_tag = f'</{tag_name}>'
+                    result.append(close_tag)
         if i in tag_starts:
             for open_tag in tag_starts[i]:
                 open_tags.append(open_tag)
                 result.append(open_tag)
         result.append(char)
     for open_tag in reversed(open_tags):
-        result.append(open_tag.replace('<', '</'))
+        tag_name = open_tag.split()[0].strip('<>')
+        close_tag = f'</{tag_name}>'
+        result.append(close_tag)
     
     final_text = ''.join(result)
     logger.info(f"[MARKUP] Preview: {final_text[:200]}...")
@@ -371,7 +376,7 @@ def convert_to_voice(file_data: bytes) -> Optional[bytes]:
     return ogg_data
 
 # ===================================================================
-# 10. СКАЧИВАНИЕ ПО URL
+# 10. СКАЧИВАНИЕ ПО URL (С УЛУЧШЕННЫМ ЛОГИРОВАНИЕМ)
 # ===================================================================
 async def download_from_url(url: str) -> Optional[bytes]:
     if not url: return None
@@ -385,10 +390,11 @@ async def download_from_url(url: str) -> Optional[bytes]:
                     data = await r.read()
                     logger.info(f"[DOWNLOAD] ✅ {len(data)} bytes in {elapsed:.2f}s")
                     return data
-                logger.error(f"[DOWNLOAD] ❌ HTTP {r.status}")
-                return None
+                else:
+                    logger.error(f"[DOWNLOAD] ❌ HTTP {r.status} for URL: {url[:150]}...")
+                    return None
     except Exception as e:
-        logger.error(f"[DOWNLOAD] ❌ {e}")
+        logger.error(f"[DOWNLOAD] ❌ URL: {url[:150]}... | Error: {e}")
         return None
 
 # ===================================================================
