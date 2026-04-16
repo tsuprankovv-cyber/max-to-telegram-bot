@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ БЕЗ РАЗДЕЛЕНИЯ ТЕКСТА
-- Исправлено принудительное закрытие HTML-тегов (ошибка 400)
-- Текст отправляется как есть, целиком (без разбивки)
+ФИНАЛЬНАЯ ВЕРСИЯ
+- Исправлен порядок тегов для вложенных сущностей (a → u → b → i)
+- Текст отправляется целиком (без разбивки)
+- Исправлено принудительное закрытие HTML-тегов
 - Увеличенный таймаут скачивания (300 секунд)
 - Прогресс скачивания больших файлов
 - Кнопки, коллажи, голосовые, документы, транслитерация
@@ -64,7 +65,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - NO TEXT SPLIT]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - FIXED TAG ORDER]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -85,7 +86,6 @@ def fix_broken_html(text: str) -> str:
     tags = ['b', 'i', 'u', 's', 'code', 'pre', 'a', 'tg-spoiler']
     
     for tag in tags:
-        # Считаем открывающие теги (с атрибутами и без)
         open_count = text.count(f'<{tag}>') + len(re.findall(f'<{tag} [^>]*>', text))
         close_count = text.count(f'</{tag}>')
         
@@ -199,7 +199,7 @@ def filter_overlapping_same_type(markup: List[Dict]) -> List[Dict]:
 
 
 # ===================================================================
-# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ
+# 7. КОНВЕРТАЦИЯ РАЗМЕТКИ (ИСПРАВЛЕН ПОРЯДОК ТЕГОВ)
 # ===================================================================
 MAX_TAG_MAP = {
     "strong": "b", "bold": "b", "b": "b",
@@ -210,6 +210,9 @@ MAX_TAG_MAP = {
     "spoiler": "tg-spoiler",
     "link": "a", "text_link": "a", "url": "a",
 }
+
+# Порядок тегов для вложенных сущностей (от внешнего к внутреннему)
+TAG_ORDER = {'a': 1, 'u': 2, 's': 3, 'b': 4, 'i': 5, 'code': 6, 'pre': 7, 'tg-spoiler': 8}
 
 
 def parse_markdown_to_html(text: str) -> str:
@@ -248,7 +251,7 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
         corrected_markup.append(entity)
         logger.debug(f"[MARKUP] Entity: {entity.get('type')} [{python_offset}:{python_offset+python_length}]")
     
-    sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), -m.get('length', 0)))
+    sorted_markup = sorted(corrected_markup, key=lambda m: (m.get('from', 0), m.get('length', 0)))
     tag_starts = {}
     tag_ends = {}
     
@@ -278,7 +281,9 @@ def apply_markup(text: str, markup: List[Dict]) -> str:
                     close_tag = f'</{tag_name}>'
                     result.append(close_tag)
         if i in tag_starts:
-            for open_tag in tag_starts[i]:
+            # СОРТИРУЕМ ТЕГИ ПО ПОРЯДКУ ВЛОЖЕННОСТИ
+            sorted_tags = sorted(tag_starts[i], key=lambda t: TAG_ORDER.get(t.split()[0].strip('<>'), 99))
+            for open_tag in sorted_tags:
                 open_tags.append(open_tag)
                 result.append(open_tag)
         result.append(char)
@@ -776,7 +781,6 @@ async def handle_max_message(msg: Dict):
     elif text:
         await tg.send_text(text, reply_markup)
 
-    # Отправляем остальные вложения
     for item in other:
         await process_attachment(item['attachment'], "")
         await asyncio.sleep(0.5)
@@ -821,14 +825,14 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-no-split'})
+    return web.json_response({'ok': True, 'version': 'final-tag-order'})
 
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - NO TEXT SPLIT]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - FIXED TAG ORDER]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
