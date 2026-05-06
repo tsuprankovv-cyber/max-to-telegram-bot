@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 MAX → Telegram Forwarder
-ФИНАЛЬНАЯ ВЕРСИЯ С УМНЫМ РАЗДЕЛЕНИЕМ ТЕКСТА
-- Умное разделение длинных текстов (>1000 символов)
-- Первая часть в caption, остальные отдельными сообщениями
-- Разделение по абзацам и предложениям, без разрыва слов и ссылок
+ФИНАЛЬНАЯ ВЕРСИЯ С ПОДДЕРЖКОЙ INLINE_KEYBOARD
+- Кнопки из reply_markup (старые пересылки)
+- Кнопки из вложений inline_keyboard (бот-постер)
+- Умное разделение длинных текстов
 - Удаление пустых HTML-тегов
 - Полное логирование
 - Исправлен порядок тегов для вложенных сущностей
@@ -66,7 +66,7 @@ RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL', '').strip()
 VERIFY_WEBHOOK_SECRET = os.getenv('VERIFY_WEBHOOK_SECRET', '1') == '1'
 
 logger.info("=" * 100)
-logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - SMART TEXT SPLIT]")
+logger.info("🚀 MAX → TELEGRAM FORWARDER [FINAL - INLINE KEYBOARD SUPPORT]")
 logger.info(f"📡 MAX Channel: {MAX_CHAN}")
 logger.info(f"📥 Telegram Chat: {TG_CHAT}")
 logger.info(f"🔗 Webhook URL: {RENDER_EXTERNAL_URL}/webhook")
@@ -154,7 +154,6 @@ def split_smart_text(text: str, max_len: int = 1000) -> List[str]:
     parts = []
     current = ""
     
-    # Разделяем по абзацам
     paragraphs = text.split('\n\n')
     
     for para in paragraphs:
@@ -167,7 +166,6 @@ def split_smart_text(text: str, max_len: int = 1000) -> List[str]:
             if current:
                 parts.append(current)
             
-            # Если абзац сам по себе длинный — делим по предложениям
             if len(para) > max_len:
                 sentences = re.split(r'(?<=[.!?])\s+', para)
                 current = ""
@@ -207,10 +205,24 @@ def convert_max_buttons(reply_markup: Dict) -> Optional[Dict]:
         for button in row:
             if button.get('type') == 'url' or button.get('url'):
                 telegram_row.append({'text': button.get('text', 'Button'), 'url': button.get('url', '')})
+            elif button.get('type') == 'callback':
+                telegram_row.append({'text': button.get('text', 'Button'), 'callback_data': button.get('payload', '{}')})
         if telegram_row:
             telegram_keyboard.append(telegram_row)
     logger.info(f"[BUTTONS] ✅ Converted {len(telegram_keyboard)} rows")
     return {'inline_keyboard': telegram_keyboard} if telegram_keyboard else None
+
+
+def extract_keyboard_from_attachments(attachments: List[Dict]) -> Optional[Dict]:
+    """Извлекает кнопки из вложений типа inline_keyboard (бот-постер)."""
+    for att in attachments:
+        if att.get('type') == 'inline_keyboard':
+            payload = att.get('payload', {})
+            buttons = payload.get('buttons', [])
+            if buttons:
+                logger.info(f"[BUTTONS] 🎛️ Found inline_keyboard in attachments: {len(buttons)} rows")
+                return convert_max_buttons({'inline_keyboard': buttons})
+    return None
 
 
 # ===================================================================
@@ -510,7 +522,7 @@ async def download_from_url(url: str) -> Optional[bytes]:
 
 
 # ===================================================================
-# 11. MEDIA PROCESSOR
+# 11. MEDIA PROCESSOR (С ПОДДЕРЖКОЙ INLINE_KEYBOARD)
 # ===================================================================
 class MediaProcessor:
     VOICE_EXTS = {'ogg', 'opus', 'oga'}
@@ -550,6 +562,9 @@ class MediaProcessor:
         if atype == 'share':
             logger.info("[MEDIA] ✅ DETERMINED: document (share)")
             return 'document', meta
+        if atype == 'inline_keyboard':
+            logger.info("[MEDIA] ✅ DETERMINED: keyboard (inline_keyboard)")
+            return 'keyboard', meta
         
         if ext in self.VOICE_EXTS:
             logger.info(f"[MEDIA] ✅ DETERMINED: voice (extension .{ext})")
@@ -622,6 +637,7 @@ class TG:
         payload = {'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
         if reply_markup:
             payload['reply_markup'] = reply_markup
+            logger.info(f"[TG] 🎛️ Sending with reply_markup")
         resp = await self._request('sendMessage', json=payload)
         return resp and resp.get('ok', False)
 
@@ -719,7 +735,7 @@ class MX:
 
 
 # ===================================================================
-# 14. ОБРАБОТЧИКИ
+# 14. ОБРАБОТЧИКИ (С ПОДДЕРЖКОЙ INLINE_KEYBOARD)
 # ===================================================================
 tg = TG(TG_TOKEN, TG_CHAT)
 mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
@@ -737,6 +753,11 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     
     tg_type, meta = media_proc.determine(att)
     logger.info(f"[ATT] Type: {tg_type}, filename: {meta.get('filename')}, size: {meta.get('size')}")
+    
+    # Пропускаем keyboard — это не медиа
+    if tg_type == 'keyboard':
+        logger.info("[ATT] ⏭ Skipping keyboard attachment")
+        return True
     
     direct_url = meta.get('url') or att.get('payload', {}).get('url')
     if not direct_url:
@@ -827,6 +848,9 @@ async def handle_max_message(msg: Dict):
 
     media_items, other = [], []
     for att in data['attachments']:
+        # Пропускаем inline_keyboard — обрабатывается отдельно
+        if att.get('type') == 'inline_keyboard':
+            continue
         t, m = media_proc.determine(att)
         item = {'type': t, 'attachment': att, 'meta': m}
         if t in ('photo', 'video'):
@@ -836,13 +860,13 @@ async def handle_max_message(msg: Dict):
 
     logger.info(f"[HANDLE] Media items: {len(media_items)}, Other: {len(other)}")
 
+    # Извлекаем кнопки из reply_markup ИЛИ из вложений inline_keyboard
     reply_markup = convert_max_buttons(data.get('reply_markup', {}))
+    if not reply_markup:
+        reply_markup = extract_keyboard_from_attachments(data['attachments'])
 
     if media_items:
-        # Умное разделение длинного текста
         text_parts = split_smart_text(text, max_len=1000) if text else []
-        
-        # Первая часть — в caption
         caption = text_parts[0] if text_parts else ""
         
         if len(media_items) == 1:
@@ -852,13 +876,11 @@ async def handle_max_message(msg: Dict):
             logger.info(f"[HANDLE] 📸 Media group: {len(media_items)} items")
             await send_media_group(media_items, caption)
         
-        # Остальные части текста — отдельными сообщениями
         for part in text_parts[1:]:
             await tg.send_text(part)
             await asyncio.sleep(0.3)
             
     elif text:
-        # Только текст — отправляем как есть (или частями если нужно)
         text_parts = split_smart_text(text, max_len=4000) if len(text) > 4000 else [text]
         for part in text_parts:
             await tg.send_text(part, reply_markup)
@@ -908,14 +930,14 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-smart-split'})
+    return web.json_response({'ok': True, 'version': 'final-keyboard-support'})
 
 
 # ===================================================================
 # 16. ЗАПУСК
 # ===================================================================
 async def main():
-    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - SMART SPLIT]...")
+    logger.info("🚀 Starting MAX → Telegram Forwarder [FINAL - KEYBOARD SUPPORT]...")
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
