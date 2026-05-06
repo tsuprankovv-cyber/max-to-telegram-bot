@@ -3,11 +3,11 @@
 MAX → Telegram Forwarder
 ФИНАЛЬНАЯ ВЕРСИЯ
 - Кнопки из inline_keyboard (бот-постер)
-- Кнопки только у последней части разделённого текста
+- Кнопки отдельным сообщением после медиа (короткий текст/без текста)
+- Кнопки у последней части разделённого длинного текста
 - Замена определённой ссылки в кнопках
 - Умное разделение длинных текстов
 - Удаление пустых HTML-тегов
-- Полное логирование
 """
 import os
 import sys
@@ -27,7 +27,7 @@ from aiohttp import web
 from mutagen import File as MutagenFile
 
 # ===================================================================
-# 1. НАСТРОЙКА ЛОГИРОВАНИЯ (ПОЛНОЕ)
+# 1. НАСТРОЙКА ЛОГИРОВАНИЯ
 # ===================================================================
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG').upper()
 LOG_RAW_MAX = os.getenv('LOG_RAW_MAX', '1') == '1'
@@ -173,12 +173,11 @@ NEW_FORM_URL = 'https://forms.yandex.ru/cloud/680f5f5ce010db158f8b7610'
 
 
 def replace_button_urls(buttons: List[List[Dict]]) -> List[List[Dict]]:
-    """Заменяет определённую ссылку в кнопках."""
     for row in buttons:
         for btn in row:
             if btn.get('url') == OLD_FORM_URL:
                 btn['url'] = NEW_FORM_URL
-                logger.info(f"[BUTTONS] 🔄 Replaced URL in button '{btn.get('text', '')}'")
+                logger.info(f"[BUTTONS] 🔄 Replaced URL in '{btn.get('text', '')}'")
     return buttons
 
 
@@ -203,7 +202,6 @@ def convert_max_buttons(reply_markup: Dict) -> Optional[Dict]:
 
 
 def extract_keyboard_from_attachments(attachments: List[Dict]) -> Optional[Dict]:
-    """Извлекает кнопки из вложений типа inline_keyboard."""
     for att in attachments:
         if att.get('type') == 'inline_keyboard':
             payload = att.get('payload', {})
@@ -501,8 +499,7 @@ class TG:
         except: return None
 
     async def send_text(self, text: str, reply_markup: Optional[Dict] = None) -> bool:
-        if not text: return True
-        text = fix_broken_html(text)
+        text = fix_broken_html(text) if text else text
         payload = {'chat_id': self.chat_id, 'text': text, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
         if reply_markup:
             payload['reply_markup'] = reply_markup
@@ -678,26 +675,29 @@ async def handle_max_message(msg: Dict):
         reply_markup = extract_keyboard_from_attachments(data['attachments'])
 
     if media_items:
-        text_parts = split_smart_text(text, max_len=1000) if text else []
-        caption = text_parts[0] if text_parts else ""
+        text_parts = split_smart_text(text, max_len=1000) if text else [""]
+        caption = text_parts[0] if text_parts[0] else ""
         
         if len(media_items) == 1:
             await process_attachment(media_items[0]['attachment'], caption)
         else:
             await send_media_group(media_items, caption)
         
-        # Остальные части текста — кнопки только к ПОСЛЕДНЕЙ
+        # Остальные части текста — кнопки к последней
         for i, part in enumerate(text_parts[1:]):
             is_last = (i == len(text_parts) - 2)
             await tg.send_text(part, reply_markup=reply_markup if is_last else None)
-            await asyncio.sleep(0.3)
+        
+        # Кнопки отдельным сообщением после медиа
+        if reply_markup and len(text_parts) <= 1:
+            await tg.send_text("\u200B", reply_markup=reply_markup)
+            logger.info("[HANDLE] 🎛️ Buttons sent as separate message after media")
             
     elif text:
         text_parts = split_smart_text(text, max_len=4000) if len(text) > 4000 else [text]
         for i, part in enumerate(text_parts):
             is_last = (i == len(text_parts) - 1)
             await tg.send_text(part, reply_markup=reply_markup if is_last else None)
-            await asyncio.sleep(0.3)
 
     for item in other:
         await process_attachment(item['attachment'], "")
@@ -724,7 +724,7 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-keyboard'})
+    return web.json_response({'ok': True, 'version': 'final-buttons'})
 
 
 # ===================================================================
