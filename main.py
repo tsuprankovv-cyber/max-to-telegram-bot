@@ -8,8 +8,8 @@ MAX → Telegram Forwarder
 - Замена определённой ссылки в кнопках
 - Умное разделение длинных текстов
 - Удаление пустых HTML-тегов
+- FIX: короткий текст + кнопки → фото без caption, текст с кнопками (без дубля)
 - FIX: документы в комбо получают caption
-- FIX: короткий текст + медиа → текст дублируется с кнопками
 """
 import os
 import sys
@@ -547,7 +547,7 @@ class TG:
         else:
             form.add_field(field, media_data, filename=safe_filename(filename) if filename else f"{media_type}.file")
         
-        if caption and media_type != 'document':
+        if caption:
             caption = fix_broken_html(caption)
             form.add_field('caption', caption)
             form.add_field('parse_mode', 'HTML')
@@ -622,7 +622,6 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     if tg_type == 'audio':
         extra.update(extract_audio_tags(file_data, meta.get('filename', '')))
     
-    # FIX: документы тоже получают caption
     return await tg.send_media(tg_type, file_data, caption, meta.get('filename', ''), False, **extra)
 
 
@@ -679,33 +678,36 @@ async def handle_max_message(msg: Dict):
 
     # =========== ИСПРАВЛЕННАЯ ЛОГИКА ОТПРАВКИ ===========
     if media_items:
-        # Разбиваем текст: первая часть → caption, остальные → отдельно
         text_parts = split_smart_text(text, max_len=1000) if text else [""]
-        caption = text_parts[0] if text_parts[0] else ""
         
-        # Отправляем фото/видео
-        if len(media_items) == 1:
-            await process_attachment(media_items[0]['attachment'], caption)
-        else:
-            await send_media_group(media_items, caption)
-        
-        # Отправляем остальные части текста
-        remaining_parts = text_parts[1:]
-        for i, part in enumerate(remaining_parts):
-            is_last = (i == len(remaining_parts) - 1)
-            await tg.send_text(part, reply_markup=reply_markup if is_last else None)
-        
-        # FIX: Если текст короткий (весь ушёл в caption), а кнопки есть —
-        # дублируем текст с кнопками, а не шлём пустое сообщение
-        if reply_markup and len(text_parts) <= 1:
-            if text and text.strip():
-                # Дублируем текст (короткий) с кнопками
-                await tg.send_text(text, reply_markup=reply_markup)
-                logger.info("[HANDLE] 🎛️ Buttons attached to duplicated text after media")
+        if len(text_parts) == 1 and reply_markup:
+            # Текст короткий + есть кнопки:
+            # Фото/видео без caption, текст отдельно с кнопками (без дубля)
+            if len(media_items) == 1:
+                await process_attachment(media_items[0]['attachment'], "")
             else:
-                # Если текста вообще нет — шлём пустое с кнопками
+                await send_media_group(media_items, "")
+            
+            if text and text.strip():
+                await tg.send_text(text, reply_markup=reply_markup)
+                logger.info("[HANDLE] 🎛️ Text with buttons after media (caption skipped)")
+            else:
                 await tg.send_text("\u200B", reply_markup=reply_markup)
-                logger.info("[HANDLE] 🎛️ Buttons sent as separate message after media (no text)")
+                logger.info("[HANDLE] 🎛️ Buttons as separate message (no text)")
+        else:
+            # Текст длинный или кнопок нет:
+            # Первая часть → caption, остальные → отдельно, кнопки к последней
+            caption = text_parts[0] if text_parts[0] else ""
+            
+            if len(media_items) == 1:
+                await process_attachment(media_items[0]['attachment'], caption)
+            else:
+                await send_media_group(media_items, caption)
+            
+            remaining_parts = text_parts[1:]
+            for i, part in enumerate(remaining_parts):
+                is_last = (i == len(remaining_parts) - 1)
+                await tg.send_text(part, reply_markup=reply_markup if is_last else None)
             
     elif text:
         # Только текст, без медиа
@@ -715,7 +717,6 @@ async def handle_max_message(msg: Dict):
             await tg.send_text(part, reply_markup=reply_markup if is_last else None)
 
     # Отправляем документы/аудио/голосовые
-    # FIX: первый документ получает текст, если фото не было
     for i, item in enumerate(other):
         caption_for_other = text if (i == 0 and not media_items) else ""
         await process_attachment(item['attachment'], caption_for_other)
@@ -742,7 +743,7 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-buttons-fix2'})
+    return web.json_response({'ok': True, 'version': 'final-fix3'})
 
 
 # ===================================================================
