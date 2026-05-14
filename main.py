@@ -3,13 +3,12 @@
 MAX → Telegram Forwarder
 ФИНАЛЬНАЯ ВЕРСИЯ
 - Кнопки из inline_keyboard (бот-постер)
-- Кнопки отдельным сообщением после медиа (короткий текст/без текста)
+- Кнопки приклеены к фото/видео с caption (единое сообщение)
 - Кнопки у последней части разделённого длинного текста
 - Замена определённой ссылки в кнопках
 - Умное разделение длинных текстов
 - Удаление пустых HTML-тегов
-- FIX: короткий текст + кнопки → фото без caption, текст с кнопками (без дубля)
-- FIX: документы в комбо получают caption
+- Без дублей текста
 """
 import os
 import sys
@@ -534,7 +533,7 @@ class TG:
         resp = await self._request('sendMediaGroup', json={'chat_id': self.chat_id, 'media': input_media})
         return resp and resp.get('ok', False)
 
-    async def send_media(self, media_type: str, media_data, caption="", filename="", is_url=False, **extra) -> bool:
+    async def send_media(self, media_type: str, media_data, caption="", filename="", is_url=False, reply_markup=None, **extra) -> bool:
         method_map = {'photo': 'sendPhoto', 'video': 'sendVideo', 'audio': 'sendAudio', 'voice': 'sendVoice', 'document': 'sendDocument'}
         method = method_map.get(media_type, 'sendDocument')
         field = media_type if media_type != 'document' else 'document'
@@ -551,6 +550,10 @@ class TG:
             caption = fix_broken_html(caption)
             form.add_field('caption', caption)
             form.add_field('parse_mode', 'HTML')
+        
+        # Кнопки для фото/видео с caption
+        if reply_markup and caption and media_type in ('photo', 'video'):
+            form.add_field('reply_markup', json.dumps(reply_markup))
         
         if media_type == 'audio':
             if extra.get('performer'): form.add_field('performer', extra['performer'][:64])
@@ -592,7 +595,7 @@ mx = MX(MAX_TOKEN, MAX_CHAN, MAX_BASE)
 media_proc = MediaProcessor()
 
 
-async def process_attachment(att: Dict, caption: str = "") -> bool:
+async def process_attachment(att: Dict, caption: str = "", reply_markup: Optional[Dict] = None) -> bool:
     if not isinstance(att, dict): return False
     
     tg_type, meta = media_proc.determine(att)
@@ -604,7 +607,7 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     if not direct_url: return False
     
     if tg_type in ('photo', 'video') and direct_url:
-        return await tg.send_media(tg_type, direct_url, caption, meta.get('filename', ''), is_url=True)
+        return await tg.send_media(tg_type, direct_url, caption, meta.get('filename', ''), is_url=True, reply_markup=reply_markup)
     
     file_data = await download_from_url(direct_url)
     if not file_data: return False
@@ -676,50 +679,32 @@ async def handle_max_message(msg: Dict):
     if not reply_markup:
         reply_markup = extract_keyboard_from_attachments(data['attachments'])
 
-    # =========== ИСПРАВЛЕННАЯ ЛОГИКА ОТПРАВКИ ===========
     if media_items:
         text_parts = split_smart_text(text, max_len=1000) if text else [""]
+        caption = text_parts[0] if text_parts[0] else ""
         
-        if len(text_parts) == 1 and reply_markup:
-            # Текст короткий + есть кнопки:
-            # Фото/видео без caption, текст отдельно с кнопками (без дубля)
-            if len(media_items) == 1:
-                await process_attachment(media_items[0]['attachment'], "")
-            else:
-                await send_media_group(media_items, "")
-            
-            if text and text.strip():
-                await tg.send_text(text, reply_markup=reply_markup)
-                logger.info("[HANDLE] 🎛️ Text with buttons after media (caption skipped)")
-            else:
-                await tg.send_text("\u200B", reply_markup=reply_markup)
-                logger.info("[HANDLE] 🎛️ Buttons as separate message (no text)")
+        # Кнопки к первому фото/видео (если текст короткий и есть кнопки)
+        first_reply_markup = reply_markup if len(text_parts) == 1 and caption else None
+        
+        if len(media_items) == 1:
+            await process_attachment(media_items[0]['attachment'], caption, reply_markup=first_reply_markup)
         else:
-            # Текст длинный или кнопок нет:
-            # Первая часть → caption, остальные → отдельно, кнопки к последней
-            caption = text_parts[0] if text_parts[0] else ""
-            
-            if len(media_items) == 1:
-                await process_attachment(media_items[0]['attachment'], caption)
-            else:
-                await send_media_group(media_items, caption)
-            
-            remaining_parts = text_parts[1:]
-            for i, part in enumerate(remaining_parts):
-                is_last = (i == len(remaining_parts) - 1)
-                await tg.send_text(part, reply_markup=reply_markup if is_last else None)
+            await send_media_group(media_items, caption)
+        
+        # Остальные части текста — кнопки к последней
+        remaining_parts = text_parts[1:]
+        for i, part in enumerate(remaining_parts):
+            is_last = (i == len(remaining_parts) - 1)
+            await tg.send_text(part, reply_markup=reply_markup if is_last else None)
             
     elif text:
-        # Только текст, без медиа
         text_parts = split_smart_text(text, max_len=4000) if len(text) > 4000 else [text]
         for i, part in enumerate(text_parts):
             is_last = (i == len(text_parts) - 1)
             await tg.send_text(part, reply_markup=reply_markup if is_last else None)
 
-    # Отправляем документы/аудио/голосовые
-    for i, item in enumerate(other):
-        caption_for_other = text if (i == 0 and not media_items) else ""
-        await process_attachment(item['attachment'], caption_for_other)
+    for item in other:
+        await process_attachment(item['attachment'], "")
         await asyncio.sleep(0.5)
 
 
@@ -743,7 +728,7 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-fix3'})
+    return web.json_response({'ok': True, 'version': 'final-unified-post'})
 
 
 # ===================================================================
