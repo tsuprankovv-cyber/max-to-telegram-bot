@@ -8,6 +8,8 @@ MAX → Telegram Forwarder
 - Замена определённой ссылки в кнопках
 - Умное разделение длинных текстов
 - Удаление пустых HTML-тегов
+- FIX: документы в комбо получают caption
+- FIX: короткий текст + медиа → текст дублируется с кнопками
 """
 import os
 import sys
@@ -620,7 +622,8 @@ async def process_attachment(att: Dict, caption: str = "") -> bool:
     if tg_type == 'audio':
         extra.update(extract_audio_tags(file_data, meta.get('filename', '')))
     
-    return await tg.send_media(tg_type, file_data, caption if tg_type != 'document' else '', meta.get('filename', ''), False, **extra)
+    # FIX: документы тоже получают caption
+    return await tg.send_media(tg_type, file_data, caption, meta.get('filename', ''), False, **extra)
 
 
 async def send_media_group(media_items: List[Dict], caption: str = "") -> bool:
@@ -674,33 +677,48 @@ async def handle_max_message(msg: Dict):
     if not reply_markup:
         reply_markup = extract_keyboard_from_attachments(data['attachments'])
 
+    # =========== ИСПРАВЛЕННАЯ ЛОГИКА ОТПРАВКИ ===========
     if media_items:
+        # Разбиваем текст: первая часть → caption, остальные → отдельно
         text_parts = split_smart_text(text, max_len=1000) if text else [""]
         caption = text_parts[0] if text_parts[0] else ""
         
+        # Отправляем фото/видео
         if len(media_items) == 1:
             await process_attachment(media_items[0]['attachment'], caption)
         else:
             await send_media_group(media_items, caption)
         
-        # Остальные части текста — кнопки к последней
-        for i, part in enumerate(text_parts[1:]):
-            is_last = (i == len(text_parts) - 2)
+        # Отправляем остальные части текста
+        remaining_parts = text_parts[1:]
+        for i, part in enumerate(remaining_parts):
+            is_last = (i == len(remaining_parts) - 1)
             await tg.send_text(part, reply_markup=reply_markup if is_last else None)
         
-        # Кнопки отдельным сообщением после медиа
+        # FIX: Если текст короткий (весь ушёл в caption), а кнопки есть —
+        # дублируем текст с кнопками, а не шлём пустое сообщение
         if reply_markup and len(text_parts) <= 1:
-            await tg.send_text("\u200B", reply_markup=reply_markup)
-            logger.info("[HANDLE] 🎛️ Buttons sent as separate message after media")
+            if text and text.strip():
+                # Дублируем текст (короткий) с кнопками
+                await tg.send_text(text, reply_markup=reply_markup)
+                logger.info("[HANDLE] 🎛️ Buttons attached to duplicated text after media")
+            else:
+                # Если текста вообще нет — шлём пустое с кнопками
+                await tg.send_text("\u200B", reply_markup=reply_markup)
+                logger.info("[HANDLE] 🎛️ Buttons sent as separate message after media (no text)")
             
     elif text:
+        # Только текст, без медиа
         text_parts = split_smart_text(text, max_len=4000) if len(text) > 4000 else [text]
         for i, part in enumerate(text_parts):
             is_last = (i == len(text_parts) - 1)
             await tg.send_text(part, reply_markup=reply_markup if is_last else None)
 
-    for item in other:
-        await process_attachment(item['attachment'], "")
+    # Отправляем документы/аудио/голосовые
+    # FIX: первый документ получает текст, если фото не было
+    for i, item in enumerate(other):
+        caption_for_other = text if (i == 0 and not media_items) else ""
+        await process_attachment(item['attachment'], caption_for_other)
         await asyncio.sleep(0.5)
 
 
@@ -724,7 +742,7 @@ async def webhook_handler(request):
 
 
 async def health_handler(request):
-    return web.json_response({'ok': True, 'version': 'final-buttons'})
+    return web.json_response({'ok': True, 'version': 'final-buttons-fix2'})
 
 
 # ===================================================================
